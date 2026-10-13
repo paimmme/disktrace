@@ -42,21 +42,10 @@ public enum AttributionPolicy {
     }
 
     /// Picks the most specific working directory that contains `path`, if any.
-    public static func scopeDirectory(for path: String, windows: [TaskWindow]) -> String? {
-        windows
-            .filter { $0.clientKind != .unknown || true }
-            .compactMap { window -> String? in
-                guard let cwd = windowCandidateDirectory(window) else { return nil }
-                return matches(filePath: path, workingDirectory: cwd) ? cwd : nil
-            }
+    public static func scopeMatch(filePath: String, directories: [String]) -> String? {
+        directories
+            .filter { matches(filePath: filePath, workingDirectory: $0) }
             .max(by: { $0.count < $1.count })
-    }
-
-    static func windowCandidateDirectory(_ window: TaskWindow) -> String? {
-        // The working directory is carried on the linked activity; the window
-        // itself stores only the session/task identity, so callers pass a
-        // resolved directory map. Kept for symmetry.
-        nil
     }
 
     // MARK: - Link scoring (§11.3)

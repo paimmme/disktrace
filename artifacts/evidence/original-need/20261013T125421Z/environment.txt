@@ -1,7 +1,0 @@
-date: Tue Oct 13 12:55:14 UTC 2026
-sw_vers: ProductName:		macOS ProductVersion:		14.6 BuildVersion:		23G80 
-arch: arm64
-head: 7779285815dd25ee1d92f862b1db9e4e02cd7a80
-Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on
-/dev/disk3s1s1   228Gi   9.6Gi   4.4Gi    69%    404k   46M    1%   /
-/dev/disk3s5     228Gi   202Gi   4.4Gi    98%    3.5M   46M    7%   /System/Volumes/Data

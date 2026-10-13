@@ -1,2 +1,0 @@
-[0/7] Write swift-version-17F43B15BD5FAF70.txt
-Build complete! (0.16s)

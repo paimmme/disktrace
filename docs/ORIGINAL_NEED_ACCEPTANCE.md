@@ -10,7 +10,7 @@
 - **RELEASE_READY**：本任务不宣称（缺正式签名、公证、双架构与发布验收）。
 
 环境：macOS 14.6 (23G80)、arm64、无 Xcode、Swift 6.2 工具链 + CLT 15.0 SDK。
-自动化测试：`swift test` → **88 项通过**（16 套件）。隔离验收：`scripts/acceptance-original-need.sh` → 全部断言 PASS。
+自动化测试：`swift test` → **99 项通过**（20 套件）。隔离验收：`scripts/acceptance-original-need.sh` → 全部断言 PASS。
 
 ## 功能能力
 

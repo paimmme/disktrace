@@ -1,5 +1,0 @@
-✔ Test "coalesced queue never exceeds its capacity" passed after 0.672 seconds.
-✔ Suite "Change monitor (live FSEvents)" passed after 0.673 seconds.
-✔ Test run with 50 tests in 13 suites passed after 0.673 seconds.
-error: XCTest not available
-error: XCTest not available

@@ -1,7 +1,0 @@
- README.md                                          |  12 +-
- Sources/DiskTraceApp/AppModel.swift                | 195 +++++++-
- Sources/DiskTraceApp/DiskTraceApp.swift            | 514 ++++++++++++++++++---
- Sources/DiskTraceCore/Storage/DiskTraceStore.swift |  31 +-
- Sources/DiskTraceCore/Storage/SQLite.swift         |   9 +-
- docs/LIMITATIONS.md                                |  10 +-
- 6 files changed, 672 insertions(+), 99 deletions(-)

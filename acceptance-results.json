@@ -1,0 +1,62 @@
+{
+  "report": "DiskTrace PR #1 review remediation",
+  "generatedAtUTC": "2026-10-13",
+  "branch": "feat/original-need-closed-loop",
+  "base": "7779285815dd25ee1d92f862b1db9e4e02cd7a80",
+  "headAtRemediationStart": "5e7f1597d711ba23e6ec83f3300162eb7bf5221d",
+  "os": "macOS 14.6 (23G80)",
+  "arch": "arm64",
+  "swift": "6.2 (extracted toolchain) + CLT 15.0 SDK",
+  "schemaVersion": 6,
+  "automatedTests": { "tests": 99, "suites": 20, "result": "PASS" },
+  "acceptanceLevels": {
+    "ENGINEERING_PASS": {
+      "status": "PASS",
+      "evidence": [
+        "swift build: Build complete",
+        "swift test: 99 tests / 20 suites pass",
+        "scripts/acceptance-original-need.sh: all assertions PASS",
+        "MR01-MR06 multi-root isolation pass",
+        "MEM01/MEM05 diff scale/hardlink pass",
+        "LS01/LS02/LS06 + RE01/RE02 low-space & restart pass",
+        "SQLite integrity_check=ok and foreign_key_check empty (MR02)"
+      ]
+    },
+    "MAC_LOCAL_PASS": {
+      "status": "PARTIAL",
+      "ran": ["real volume sampling", "real file add/grow/remove scans on temp roots"],
+      "notRun": ["interactive start/stop UI", "power sleep/wake", "resource 24h"]
+    },
+    "CODEX_CLIENT_PASS": {
+      "status": "NOT RUN",
+      "reason": "no verified real Codex client; JSONL fixtures only"
+    },
+    "LOGIN_RECOVERY_PASS": {
+      "status": "NOT RUN",
+      "reason": "SMAppService registration + real login/logout not exercised on device"
+    },
+    "RELEASE_READY": {
+      "status": "NO",
+      "reason": "no Developer ID signing, notarization, or dual-arch release verification"
+    }
+  },
+  "workPackages": {
+    "WP0": { "status": "PASS", "evidence": "baseline env/build/test/acceptance + schema snapshot captured" },
+    "WP1": { "status": "PASS", "evidence": "cross-root summary delete fixed; MR01-MR06" },
+    "WP2": { "status": "PASS", "evidence": "streaming SQL diff; MEM01 10k RSS~72MB; EXPLAIN uses index SEARCH, no sort" },
+    "WP3": { "status": "PASS", "evidence": "low-space ladder; LS01/LS02/LS06" },
+    "WP4": { "status": "PASS", "evidence": "startup baseline recovery + recoveryWindow timing; RE01/RE02" },
+    "WP5": { "status": "PARTIAL", "evidence": "outbox/dispatch tests (N/NT) pass; real authorization = NOT RUN" },
+    "WP6": { "status": "PASS", "evidence": "size-unknown directory mark; dead-code removal; timing semantics" },
+    "WP7": { "status": "PASS", "evidence": "strict packaging verify; docs count corrected; artifacts de-indexed" }
+  },
+  "residualRisks": [
+    "G5 process-level tracing remains BLOCKED / NOT SHIPPABLE",
+    "real Codex client coverage NOT RUN",
+    "system notification delivery NOT RUN",
+    "login recovery NOT RUN",
+    "24h resource measurement NOT RUN",
+    "inventory live-hint per-path probing not yet implemented"
+  ],
+  "mergeRecommendation": "ENGINEERING_READY_FOR_MERGE"
+}

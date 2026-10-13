@@ -33,7 +33,7 @@
 
 ## 本次验证记录
 
-- `swift build` 成功；`swift test` → **88 项通过 / 16 套件**。
+- `swift build` 成功；`swift test` → **99 项通过 / 20 套件**。
 - `scripts/acceptance-original-need.sh` → 隔离 fixture 中全部断言 PASS（具体文件、任务窗口、事件、并发 Downloads 保持 unknown、增长）。
 - 真实 Codex 客户端、系统通知、登录恢复、24 小时资源、签名/公证发布：**NOT RUN / BLOCKED**。
 

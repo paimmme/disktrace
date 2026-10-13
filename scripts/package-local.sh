@@ -86,7 +86,21 @@ PLIST
 
 echo "== signing (identity: $IDENTITY) =="
 codesign --force --sign "$IDENTITY" "$AGENT_APP"
+AGENT_SIGN=$?
 codesign --force --sign "$IDENTITY" "$APP"
-echo "== verifying =="
-codesign --verify --deep --strict --verbose=1 "$APP" || true
+APP_SIGN=$?
+echo "codesign exit codes: agent=$AGENT_SIGN app=$APP_SIGN"
+if [ "$AGENT_SIGN" -ne 0 ] || [ "$APP_SIGN" -ne 0 ]; then
+  echo "ERROR: codesign failed (agent=$AGENT_SIGN app=$APP_SIGN)" >&2
+  exit 1
+fi
+
+echo "== verifying (strict) =="
+if ! codesign --verify --deep --strict --verbose=2 "$APP"; then
+  echo "ERROR: codesign --verify --deep --strict FAILED — bundle is not validly signed" >&2
+  exit 1
+fi
+codesign -dvvv "$APP" 2>&1 | sed -n '1,12p'
 echo "packaged: $APP"
+echo "NOTE: ad-hoc ('-') signature is for LOCAL use only; distribution requires a"
+echo "      Developer ID identity, hardened runtime and notarization."

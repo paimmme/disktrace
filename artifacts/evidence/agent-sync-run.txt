@@ -1,8 +1,0 @@
-# runtime: schema v3 + incremental codex sync across a restart
-## agent_activities (both rows keep session id + cwd)
-sess|has_task|bounded|working_directory
-01d32779|1|1|/tmp/dt-run/root
-01d32779|1|1|/tmp/dt-run/root
-## session_sync
-byte_offset|file_size
-472|472

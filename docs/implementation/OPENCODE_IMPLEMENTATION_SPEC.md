@@ -51,7 +51,7 @@
 
 ### 0.2 代码与正在运行的环境
 
-- 实际源码：`/Users/wangjie/Documents/DiskTrace`；不是 `Documents/Default Project`。
+- 实际源码：`$HOME/Documents/DiskTrace`；不是 `Documents/Default Project`。
 - Git 基线 HEAD：`7779285815dd25ee1d92f862b1db9e4e02cd7a80`。
 - HEAD 之后有已完成且未提交的 UI、只读连接、测试和文档改动。它们是工作基线的一部分，不是垃圾。不得 reset、checkout 覆盖、清理或重建掉这些改动。
 - 重要未提交文件：`Sources/DiskTraceApp/AppModel.swift`、`DiskTraceApp.swift`、`Sources/DiskTraceCore/Storage/DiskTraceStore.swift`、`SQLite.swift`、`Tests/DiskTraceCoreTests/ReadOnlySnapshotTests.swift`、`docs/PRODUCT_STATUS.md`、`README.md`、`docs/LIMITATIONS.md`。
@@ -193,7 +193,7 @@ DiskTrace Agent（当前用户、唯一 DB 写者）
 
 ### 4.1 config.json
 
-使用 Codable 严格验证；版本不支持时保持旧配置，写错误回执，不能悄悄覆盖用户配置。下面是字段合同示例，路径占位由实际 home 解析；不得把 `/Users/wangjie` 写死进可分发程序。
+使用 Codable 严格验证；版本不支持时保持旧配置，写错误回执，不能悄悄覆盖用户配置。下面是字段合同示例，路径占位由实际 home 解析；不得把 `$HOME` 写死进可分发程序。
 
 ```json
 {
@@ -1376,7 +1376,7 @@ R10 的系统登录操作由用户完成；不要为了验收自行退出用户�
 在 Package.swift 明确列出 UI App 和嵌入式 Agent App 的 executable products，保留 DiskTraceCore 与原 CLI。编译目标仍为 macOS 14，不能因为 ServiceManagement 引入 macOS 26 下限。
 
 ```bash
-cd '/Users/wangjie/Documents/DiskTrace'
+cd '$HOME/Documents/DiskTrace'
 export DISKTRACE_SWIFT_TC='/private/tmp/swift-6.2-expanded/swifttc/swift-6.2-RELEASE-osx-package.pkg/Payload'
 # 先检查上面目录存在；不存在则检查已安装 toolchain，不直接下载。
 source scripts/toolchain-env.sh

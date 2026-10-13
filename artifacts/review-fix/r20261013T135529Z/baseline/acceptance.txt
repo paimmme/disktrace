@@ -1,8 +1,0 @@
-results:
-baseline	PASS	first scan establishes baseline
-file-detail	PASS	project file recorded with concrete path
-task-window	PASS	bounded task window recorded
-event	PASS	storage event assembled
-concurrent-unknown	PASS	Downloads stays unknown
-grown	PASS	growth recorded
-artifact dir: artifacts/review-fix/r20261013T135529Z/baseline/acceptance

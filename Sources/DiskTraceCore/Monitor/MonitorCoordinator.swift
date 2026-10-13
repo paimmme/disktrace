@@ -94,6 +94,15 @@ public actor MonitorCoordinator {
     private var lastRetention: Date?
     private var running = false
     private var openGaps: [CoverageGap] = []
+    private var completedFirstCalibration = false
+
+    /// Low-space behaviour ladder. Volume sampling and neutral safety alerts are
+    /// never suspended; only the expensive inventory work sheds load.
+    enum ResourceMode: String, Sendable {
+        case normal
+        case constrained
+        case critical
+    }
 
     public init(
         config: MonitorConfig,
@@ -139,12 +148,17 @@ public actor MonitorCoordinator {
         if let activitySync {
             _ = await activitySync.sync(store: store, now: timeSource.now())
         }
-        // Establish a baseline generation for each root so the first scheduled
-        // recalibration diffs against it instead of reporting existing files as new.
+        // Establish a baseline generation for each root. A root that already has
+        // a valid active generation is *not* rescanned on startup; the periodic
+        // calibration picks up any changes as a recovery window instead.
         var startChanges: [FileChange] = []
         for root in config.roots {
+            let rootID = MonitoredRoot.stableID(canonicalPath: FilePaths.canonical(root.path))
+            if await validActiveGeneration(rootID: rootID) { continue }
             do {
-                if let published = try await scanAndPublish(root: root, now: timeSource.now()) {
+                if let published = try await scanAndPublish(
+                    root: root, now: timeSource.now(), timing: .recoveryWindow)
+                {
                     startChanges.append(contentsOf: published.fileChanges)
                     _ = try await evaluate(deltas: published.directoryDeltas, now: timeSource.now())
                 }
@@ -214,29 +228,47 @@ public actor MonitorCoordinator {
 
         // 4. File-inventory recalibration (per root, periodic or forced).
         var publishedChanges: [FileChange] = []
-        let lowSpace = lastFreeBytes < config.retention.lowSpaceShedBytes
-        for root in config.roots where !lowSpace {
-            let key = FilePaths.canonical(root.path)
-            let last = lastCalibrationByRoot[key]
-            let due = last == nil || now.timeIntervalSince(last!) >= config.calibrationInterval
-            guard due else { continue }
-            do {
-                if let published = try await scanAndPublish(root: root, now: now) {
-                    report.fileChangeCount += published.fileChanges.count
-                    publishedChanges.append(contentsOf: published.fileChanges)
-                    report.deltas.append(contentsOf: published.directoryDeltas)
-                    report.decisions.append(contentsOf: try await evaluate(deltas: published.directoryDeltas, now: now))
+        let mode = resourceMode()
+        if mode == .normal {
+            let timing: TimingPrecision = completedFirstCalibration ? .scanWindow : .recoveryWindow
+            for root in config.roots {
+                let key = FilePaths.canonical(root.path)
+                let last = lastCalibrationByRoot[key]
+                let due = last == nil || now.timeIntervalSince(last!) >= config.calibrationInterval
+                guard due else { continue }
+                do {
+                    if let published = try await scanAndPublish(root: root, now: now, timing: timing) {
+                        report.fileChangeCount += published.fileChanges.count
+                        publishedChanges.append(contentsOf: published.fileChanges)
+                        report.deltas.append(contentsOf: published.directoryDeltas)
+                        report.decisions.append(contentsOf: try await evaluate(deltas: published.directoryDeltas, now: now))
+                    }
+                    lastCalibrationByRoot[key] = now
+                } catch let error as ScannerUnavailableError {
+                    let gap = CoverageGap(
+                        start: now, cause: .scannerUnavailable,
+                        affectedRoots: [root.path], severity: .medium)
+                    openGaps.append(gap)
+                    try await store.insert(gap)
+                    report.gaps.append(gap)
+                    _ = error
                 }
-                lastCalibrationByRoot[key] = now
-            } catch let error as ScannerUnavailableError {
-                let gap = CoverageGap(
-                    start: now, cause: .scannerUnavailable,
-                    affectedRoots: [root.path], severity: .medium)
-                openGaps.append(gap)
-                try await store.insert(gap)
-                report.gaps.append(gap)
-                _ = error
             }
+            completedFirstCalibration = true
+        } else {
+            // Constrained / Critical: the most valuable facts in low space are
+            // the volume samples and the neutral safety alert, which continue.
+            // Inventory staging is suspended and each root is marked quota-limited
+            // so the health view never claims `ready`. This is a bounded, explicit
+            // degradation — not a silent gap.
+            let roots = (try? await store.roots()) ?? []
+            for root in roots {
+                try? await store.markRootState(rootID: root.id, state: .quotaLimited)
+            }
+            report.gaps.append(
+                CoverageGap(
+                    start: now, cause: .permissionDenied,
+                    affectedRoots: config.roots.map(\.path), severity: .low))
         }
 
         // 4b. Assemble user-facing events from file changes, persist, evaluate.
@@ -350,7 +382,9 @@ public actor MonitorCoordinator {
         }
     }
 
-    private func scanAndPublish(root: URL, now: Date) async throws -> PublishResult? {
+    private func scanAndPublish(
+        root: URL, now: Date, timing: TimingPrecision = .scanWindow
+    ) async throws -> PublishResult? {
         let canonical = FilePaths.canonical(root.path)
         let volumeID = (try? sampler.sample(url: root, at: now))?.volumeID
         let rootRecord = try await store.ensureRoot(
@@ -369,7 +403,8 @@ public actor MonitorCoordinator {
             try await stager.flush()
             if completion.complete {
                 return try await store.publishScan(
-                    rootID: rootRecord.id, scanID: scanID, at: timeSource.now(), complete: true)
+                    rootID: rootRecord.id, scanID: scanID, at: timeSource.now(), complete: true,
+                    timing: timing, sizeComplete: completion.sizeComplete)
             }
             let gap = CoverageGap(
                 start: now, cause: .permissionDenied, affectedRoots: [canonical], severity: .medium)
@@ -553,6 +588,23 @@ public actor MonitorCoordinator {
             }
             try? await store.recordPresence(result)
         }
+    }
+
+    /// Low-space ladder derived from the last observed free space.
+    private func resourceMode() -> ResourceMode {
+        guard lastFreeBytes != .max else { return .normal }
+        if lastFreeBytes < config.retention.lowSpaceShedBytes / 2 { return .critical }
+        if lastFreeBytes < config.retention.lowSpaceShedBytes { return .constrained }
+        return .normal
+    }
+
+    /// True when a root already has an active generation owned by it, so startup
+    /// can trust it as a historical baseline instead of rescanning unconditionally.
+    private func validActiveGeneration(rootID: UUID) async -> Bool {
+        guard let health = try? await store.rootHealth(rootID: rootID),
+            let active = health.activeScanID
+        else { return false }
+        return (try? await store.scanOwner(scanID: active)) == rootID
     }
 
     public func health() async -> MonitorHealth {

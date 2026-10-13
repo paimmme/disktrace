@@ -45,7 +45,7 @@ Legend: **PASS** (executed here), **NOT RUN** (not executed), **BLOCKED**
 | Truncation/rotation recorded, not silently absorbed | `CodexSyncTests.truncationResets` |
 | Database occupancy is explainable and bounded | `RetentionTests.quotaPrunes` (effective pages + file size) |
 
-## 原始需求闭环（本轮新增，88 tests / 16 suites）
+## 原始需求闭环（本轮新增，99 tests / 20 suites）
 
 新增测试套件覆盖规格的 C/D/E/N 场景：
 
@@ -56,6 +56,6 @@ Legend: **PASS** (executed here), **NOT RUN** (not executed), **BLOCKED**
 
 - `MetadataProbe` / `StreamingScanner`：`FixtureScannerTests` + `FileChangeTests.D08`（symlink 不跟随）。
 
-**88 tests in 16 suites, all passing.** 隔离端到端：`scripts/acceptance-original-need.sh`（全部断言 PASS）。原始证据：`artifacts/evidence/original-need/`。
+**99 tests in 20 suites, all passing.** 隔离端到端：`scripts/acceptance-original-need.sh`（全部断言 PASS）。原始证据：`artifacts/evidence/original-need/`。
 
 真实机器 / 真实客户端 / 通知 / 登录恢复 / 24 小时资源：见 `docs/ORIGINAL_NEED_ACCEPTANCE.md`（NOT RUN/BLOCKED）。

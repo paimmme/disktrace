@@ -1,6 +1,6 @@
 # 交给 OpenCode 的执行指令
 
-请在 `/Users/wangjie/Documents/DiskTrace` 中执行本任务。
+请在 `$HOME/Documents/DiskTrace` 中执行本任务。
 
 首先完整阅读：
 

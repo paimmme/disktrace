@@ -15,7 +15,7 @@
 ## 构建与测试
 
 ```bash
-cd '/Users/wangjie/Documents/DiskTrace'
+cd '$HOME/Documents/DiskTrace'
 export DISKTRACE_SWIFT_TC='/private/tmp/swift-6.2-expanded/swifttc/swift-6.2-RELEASE-osx-package.pkg/Payload'
 source scripts/toolchain-env.sh          # 复用已安装工具链，不下载
 swift build

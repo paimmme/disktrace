@@ -1,6 +1,0 @@
-baseline	PASS	first scan establishes baseline
-file-detail	PASS	project file recorded with concrete path
-task-window	PASS	bounded task window recorded
-event	PASS	storage event assembled
-concurrent-unknown	PASS	Downloads stays unknown
-grown	PASS	growth recorded

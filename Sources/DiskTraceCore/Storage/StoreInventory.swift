@@ -54,6 +54,18 @@ extension DiskTraceStore {
         return result
     }
 
+    /// Updates only the health state, preserving the active generation and the
+    /// last success time (used by the low-space state machine).
+    public func markRootState(rootID: UUID, state: RootState, coverage: String? = nil) throws {
+        try rawExecute(
+            """
+            INSERT INTO root_health (root_id, state, inventory_coverage) VALUES (?, ?, ?)
+            ON CONFLICT(root_id) DO UPDATE SET state=excluded.state,
+                inventory_coverage=COALESCE(excluded.inventory_coverage, root_health.inventory_coverage);
+            """,
+            [.text(rootID.uuidString), .text(state.rawValue), .text(coverage ?? "pending")])
+    }
+
     public func rootHealth(rootID: UUID) throws -> RootHealth? {
         let statement = try database.prepare("SELECT * FROM root_health WHERE root_id=?;")
         guard try statement.run([.text(rootID.uuidString)]) else { return nil }
@@ -279,7 +291,8 @@ extension DiskTraceStore {
     /// active generation, and reclaims the old inventory. UI never sees a partial
     /// generation because the flip is one short transaction.
     public func publishScan(
-        rootID: UUID, scanID: UUID, at date: Date, complete: Bool
+        rootID: UUID, scanID: UUID, at date: Date, complete: Bool,
+        timing: TimingPrecision = .scanWindow, sizeComplete: Bool = true
     ) throws -> PublishResult {
         if !complete {
             try failScan(
@@ -326,7 +339,8 @@ extension DiskTraceStore {
                 DirectoryDelta(
                     pathID: path, windowStart: windowStart, windowEnd: date,
                     deltaAllocatedBytes: new - old, beforeAllocatedBytes: old,
-                    afterAllocatedBytes: new, checkpointID: 0, calibration: .calibrated))
+                    afterAllocatedBytes: new, checkpointID: 0,
+                    calibration: sizeComplete ? .calibrated : .coverageGap))
         }
 
         var emitted: [FileChange] = []
@@ -347,7 +361,8 @@ extension DiskTraceStore {
                         path: row.path, pathAfter: row.path, identityBefore: nil, identityAfter: newId,
                         kind: .added, before: nil, after: row.newAllocated, beforeLogical: nil,
                         afterLogical: row.newLogical, delta: row.newAllocated, rootID: rootID,
-                        scanID: scanID, windowStart: windowStart, windowEnd: date, observedAt: date)
+                        scanID: scanID, windowStart: windowStart, windowEnd: date, observedAt: date,
+                        timing: timing)
                     addedByIdentity[newId, default: []].append(change)
                     addedLinks[newId] = row.newLink ?? 1
                 } else if let oldId = row.oldId, row.newId == nil {
@@ -356,13 +371,13 @@ extension DiskTraceStore {
                         kind: .removed, before: row.oldAllocated, after: nil,
                         beforeLogical: row.oldLogical, afterLogical: nil,
                         delta: row.oldAllocated.map { -$0 }, rootID: rootID, scanID: scanID,
-                        windowStart: windowStart, windowEnd: date, observedAt: date)
+                        windowStart: windowStart, windowEnd: date, observedAt: date, timing: timing)
                     removedByIdentity[oldId, default: []].append(change)
                     removedLinks[oldId] = row.oldLink ?? 1
                 } else if row.oldId != nil, row.newId != nil {
                     guard let change = Self.changedRow(
                         row: row, rootID: rootID, scanID: scanID, windowStart: windowStart,
-                        windowEnd: date, observedAt: date)
+                        windowEnd: date, observedAt: date, timing: timing)
                     else { return }
                     batch.append(change)
                     if batch.count >= 500 {
@@ -385,7 +400,7 @@ extension DiskTraceStore {
                 guard (removedLinks[identity] ?? 1) <= 1, (addedLinks[identity] ?? 1) <= 1 else {
                     continue
                 }
-                moves.append(Self.moved(removed: removed[0], added: added[0]))
+                moves.append(Self.moved(removed: removed[0], added: added[0], timing: timing))
                 movedIdentities.insert(identity)
             }
             var tail: [FileChange] = []
@@ -428,7 +443,7 @@ extension DiskTraceStore {
         path: String, pathAfter: String, identityBefore: String?, identityAfter: String?,
         kind: FileChangeKind, before: Int64?, after: Int64?, beforeLogical: Int64?,
         afterLogical: Int64?, delta: Int64?, rootID: UUID, scanID: UUID, windowStart: Date,
-        windowEnd: Date, observedAt: Date
+        windowEnd: Date, observedAt: Date, timing: TimingPrecision
     ) -> FileChange {
         FileChange(
             id: FileChange.stableID(
@@ -441,12 +456,12 @@ extension DiskTraceStore {
             beforeLogical: beforeLogical, afterLogical: afterLogical, beforeAllocated: before,
             afterAllocated: after, deltaAllocated: delta,
             measurement: (kind != .added && before == nil) ? .beforeUnknown : .measured,
-            timing: .scanWindow, evidenceVersion: EvidenceVersion.current)
+            timing: timing, evidenceVersion: EvidenceVersion.current)
     }
 
     private static func changedRow(
         row: DiffRow, rootID: UUID, scanID: UUID, windowStart: Date, windowEnd: Date,
-        observedAt: Date
+        observedAt: Date, timing: TimingPrecision
     ) -> FileChange? {
         guard let oldId = row.oldId, let newId = row.newId else { return nil }
         let oldBytes = row.oldAllocated
@@ -471,10 +486,10 @@ extension DiskTraceStore {
             path: row.path, pathAfter: row.path, identityBefore: oldId, identityAfter: newId,
             kind: kind, before: oldBytes, after: newBytes, beforeLogical: row.oldLogical,
             afterLogical: row.newLogical, delta: delta, rootID: rootID, scanID: scanID,
-            windowStart: windowStart, windowEnd: windowEnd, observedAt: observedAt)
+            windowStart: windowStart, windowEnd: windowEnd, observedAt: observedAt, timing: timing)
     }
 
-    private static func moved(removed: FileChange, added: FileChange) -> FileChange {
+    private static func moved(removed: FileChange, added: FileChange, timing: TimingPrecision) -> FileChange {
         FileChange(
             id: FileChange.stableID(
                 evidenceVersion: removed.evidenceVersion, rootID: removed.rootID,
@@ -487,7 +502,7 @@ extension DiskTraceStore {
             windowEnd: removed.windowEnd, observedAt: removed.observedAt,
             beforeLogical: removed.beforeLogical, afterLogical: added.afterLogical,
             beforeAllocated: removed.beforeAllocated, afterAllocated: added.afterAllocated,
-            deltaAllocated: 0, measurement: .measured, timing: .scanWindow,
+            deltaAllocated: 0, measurement: .measured, timing: timing,
             evidenceVersion: removed.evidenceVersion)
     }
 

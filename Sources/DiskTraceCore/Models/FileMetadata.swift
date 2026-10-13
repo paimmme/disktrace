@@ -92,10 +92,14 @@ public struct ScanCompletion: Sendable {
     public let directoryCount: Int
     public let checkpointID: UInt64
     public let termination: ScanTermination
+    /// False when at least one regular file's allocated size could not be read,
+    /// so directory totals are a lower bound rather than an exact figure.
+    public let sizeComplete: Bool
 
     public init(
         root: String, startedAt: Date, endedAt: Date, complete: Bool, entryCount: Int,
-        directoryCount: Int, checkpointID: UInt64, termination: ScanTermination
+        directoryCount: Int, checkpointID: UInt64, termination: ScanTermination,
+        sizeComplete: Bool = true
     ) {
         self.root = root
         self.startedAt = startedAt
@@ -105,5 +109,6 @@ public struct ScanCompletion: Sendable {
         self.directoryCount = directoryCount
         self.checkpointID = checkpointID
         self.termination = termination
+        self.sizeComplete = sizeComplete
     }
 }

@@ -44,6 +44,7 @@ struct StreamingScanner {
         var directoryCount = 0
         var complete = true
         var termination: ScanTermination = .completed
+        var sizeComplete = true
         var stack: [Frame] = []
 
         guard let rootDir = opendir(rootPath) else {
@@ -108,6 +109,7 @@ struct StreamingScanner {
 
             switch metadata.kind {
             case .regularFile:
+                if metadata.allocatedBytes == nil { sizeComplete = false }
                 top.ownAllocated += metadata.allocatedBytes ?? 0
                 top.ownFiles += 1
                 entryCount += 1
@@ -144,7 +146,8 @@ struct StreamingScanner {
         return ScanCompletion(
             root: rootPath, startedAt: started, endedAt: Date(), complete: complete,
             entryCount: entryCount, directoryCount: directoryCount,
-            checkpointID: FSEventCheckpoint.currentEventID(), termination: termination)
+            checkpointID: FSEventCheckpoint.currentEventID(), termination: termination,
+            sizeComplete: sizeComplete)
     }
 
     /// Extracts a dirent name without allocating a String for the whole buffer.

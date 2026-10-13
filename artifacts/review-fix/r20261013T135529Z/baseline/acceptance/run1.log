@@ -1,6 +1,0 @@
-disktrace-agent starting; db=/var/folders/mq/05gpv9cd22n7khjpp7j3s4980000gn/T//disktrace-e2e.zh7Neb/db.sqlite
-  monitoring root: /var/folders/mq/05gpv9cd22n7khjpp7j3s4980000gn/T//disktrace-e2e.zh7Neb/projectA
-  monitoring root: /var/folders/mq/05gpv9cd22n7khjpp7j3s4980000gn/T//disktrace-e2e.zh7Neb/Downloads
-  codex sessions: /var/folders/mq/05gpv9cd22n7khjpp7j3s4980000gn/T//disktrace-e2e.zh7Neb/codexHome
-cycle: changes=0 deltas=0 decisions=0 gaps=0 sample=none running=true
-disktrace-agent stopped
