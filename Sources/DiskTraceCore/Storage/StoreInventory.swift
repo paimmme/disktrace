@@ -122,6 +122,7 @@ extension DiskTraceStore {
     }
 
     public func stageInventory(rootID: UUID, scanID: UUID, files: [FileMetadata]) throws -> Int {
+        inventoryBudgetCache = nil
         guard !files.isEmpty else { return 0 }
         let statement = try database.prepare(
             """
@@ -146,6 +147,7 @@ extension DiskTraceStore {
     }
 
     public func stageDirectorySummaries(scanID: UUID, summaries: [DirectorySize]) throws -> Int {
+        inventoryBudgetCache = nil
         guard !summaries.isEmpty else { return 0 }
         let statement = try database.prepare(
             """
@@ -167,6 +169,7 @@ extension DiskTraceStore {
     /// Discards a failed/cancelled preparing generation without touching the
     /// active baseline.
     public func failScan(rootID: UUID, scanID: UUID, reason: String, state: RootState, at date: Date) throws {
+        inventoryBudgetCache = nil
         try database.transaction {
             try rawExecute("DELETE FROM file_inventory WHERE scan_id=?;", [.text(scanID.uuidString)])
             try rawExecute(
@@ -294,6 +297,7 @@ extension DiskTraceStore {
         rootID: UUID, scanID: UUID, at date: Date, complete: Bool,
         timing: TimingPrecision = .scanWindow, sizeComplete: Bool = true
     ) throws -> PublishResult {
+        inventoryBudgetCache = nil
         if !complete {
             try failScan(
                 rootID: rootID, scanID: scanID, reason: "incomplete", state: .needsRebaseline,

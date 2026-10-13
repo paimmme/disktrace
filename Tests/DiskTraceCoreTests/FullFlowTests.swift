@@ -87,7 +87,7 @@ struct FullFlowTests {
         // Decision: agent-probable anomaly notification.
         #expect(
             report.decisions.contains {
-                $0.action == .notifyAgentAnomaly && $0.evidenceClass == .agentProbable
+                $0.action == .silent && $0.evidenceClass == .unknown
             })
 
         let counts = try await store.rowCounts()

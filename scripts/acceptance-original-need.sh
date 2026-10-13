@@ -11,13 +11,13 @@ cd "$(dirname "$0")/.."
 ARTIFACT_DIR="artifacts/evidence/original-need/$(date -u +%Y%m%dT%H%M%SZ)"
 KEEP=0
 NOTIFICATION_TEST=0
-CODEX_HOME=""
+FIXTURE_CODEX_HOME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --artifact-dir) ARTIFACT_DIR="$2"; shift 2;;
     --keep-fixture) KEEP=1; shift;;
     --notification-test) NOTIFICATION_TEST=1; shift;;
-    --codex-home) CODEX_HOME="$2"; shift 2;;
+    --codex-home) FIXTURE_CODEX_HOME="$2"; shift 2;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -32,7 +32,11 @@ record() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$RESULTS"; [ "$2" = "PASS" ]
 FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/disktrace-e2e.XXXXXX")"
 PROJECT="$FIXTURE/projectA"
 DOWNLOADS="$FIXTURE/Downloads"
-CODEX="${CODEX_HOME:-$FIXTURE/codexHome}"
+CODEX="$FIXTURE/codexHome"
+if [ -n "$FIXTURE_CODEX_HOME" ]; then
+  echo "--codex-home is disabled: acceptance always owns an isolated temporary home" >&2
+  exit 2
+fi
 DB="$FIXTURE/db.sqlite"
 mkdir -p "$PROJECT" "$DOWNLOADS" "$CODEX/sessions/2026/10/13"
 

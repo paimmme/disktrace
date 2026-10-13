@@ -12,7 +12,7 @@ public final class SingleWriterLock: @unchecked Sendable {
     private var descriptor: Int32 = -1
 
     public init(path: String) throws {
-        let fd = open(path, O_CREAT | O_RDWR, 0o600)
+        let fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw SingleWriterLockError.openFailed(errno) }
         if flock(fd, LOCK_EX | LOCK_NB) != 0 {
             close(fd)

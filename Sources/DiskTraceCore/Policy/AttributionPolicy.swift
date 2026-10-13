@@ -68,6 +68,9 @@ public enum AttributionPolicy {
         let overlapping = candidates.filter { $0.overlaps }
         let matched = overlapping.filter { $0.isAncestorOfScope }
         let ambiguous = matched.count > 1
+        let reliableLiveChanges = !changes.isEmpty && changes.allSatisfy {
+            $0.timing == .liveHintWindow && $0.measurement == .measured && $0.deltaAllocated != nil
+        }
 
         return overlapping.map { candidate in
             let state: TaskLinkState
@@ -78,7 +81,7 @@ public enum AttributionPolicy {
             } else if ambiguous {
                 state = .ambiguous
                 basis = "workingDirectoryPathMatch+multipleCandidates"
-            } else if candidate.confident {
+            } else if candidate.confident && reliableLiveChanges {
                 state = .pathCandidate
                 basis = "workingDirectoryPathMatch"
             } else {

@@ -47,13 +47,11 @@ public struct NotificationDispatcher: Sendable {
                     id: item.id, state: .deferredQuietHours, at: now)
             case .deliver:
                 let title = NotificationCopy.title(category: item.category)
-                let body = item.eventID.map { _ in
-                    NotificationCopy.body(
-                        category: item.category, freeBytes: nil, scopeName: nil, netBytes: nil,
-                        detail: false)
-                } ?? NotificationCopy.body(
-                    category: item.category, freeBytes: nil, scopeName: nil, netBytes: nil,
-                    detail: false)
+                let event = if let id = item.eventID { try? await store.event(id: id) } else { nil as StorageEvent? }
+                let samples = try? await store.timelineSamples(from: now.addingTimeInterval(-180), to: now)
+                let free = samples?.last.flatMap { $0.status == .available ? $0.freeBytes : nil }
+                let body = NotificationCopy.body(category: item.category, freeBytes: free,
+                    scopeName: event?.scopePath, netBytes: event?.netBytes, detail: false)
                 let result = await sink.deliver(
                     item: item, title: title, body: body, eventID: item.eventID)
                 switch result {

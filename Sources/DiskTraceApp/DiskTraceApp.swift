@@ -101,6 +101,16 @@ struct RootView: View {
                 do { try await Task.sleep(for: .seconds(15)) } catch { return }
             }
         }
+        .onOpenURL { url in
+            guard url.scheme == "disktrace" else { return }
+            if url.host == "event", let id = UUID(uuidString: url.lastPathComponent) {
+                page = .events
+                Task {
+                    await model.refresh()
+                    await model.openEvent(id)
+                }
+            } else { page = .overview }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await model.refresh() } }
         }
@@ -172,7 +182,7 @@ private struct OverviewView: View {
                     Label("何时：可用空间的变化曲线", systemImage: "clock")
                     Label("哪里：已监控目录的净变化", systemImage: "folder")
                     Label("原因：有证据才显示关联", systemImage: "magnifyingglass")
-                    Text("当前 Agent 任务关联仍待修复核验。未知来源会保留为未知；这里还不能追溯具体下载文件。")
+                    Text("打开“文件与事件”查看监控范围内的具体文件变化。变化来自扫描窗口；任务关联尚未完成真实客户端验证，未知来源会保留为未知。")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }.font(.callout).frame(maxWidth: .infinity, alignment: .leading)
             }.padding(.vertical, 4)
@@ -350,7 +360,7 @@ private struct GrowthDetail: View {
                     }
                 }
             }
-            Notice(icon: "info.circle", title: "关联线索需要核验", detail: "当前版本的 Agent 任务关联仍有已知缺陷。时间或工作目录重合不能证明某个文件由 Agent 下载；暂不展示未经验证的任务名称或进程。", color: Palette.blue)
+            Notice(icon: "info.circle", title: "关联线索需要核验", detail: "时间或工作目录重合不能证明某个文件由 Agent 下载。当前记录扫描窗口与任务候选；真实客户端和即时路径探测尚未验收，来源不足时保持未知。", color: Palette.blue)
             HStack {
                 Button("在 Finder 中查看", systemImage: "arrow.up.forward.square") { model.reveal(summary.path) }
                 Button("复制路径", systemImage: "doc.on.doc") {
@@ -391,6 +401,8 @@ private struct HealthView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             SectionPanel(title: "数据是否仍在更新", subtitle: "以最新容量采样判断时效，不把数据库存在当成后台正常。") {
+                LabeledContent("扫描状态", value: model.paused ? "已暂停；容量采样继续" : "按配置执行扫描")
+                LabeledContent("后台心跳", value: model.heartbeat?.formatted(date: .omitted, time: .standard) ?? "尚无记录")
                 LabeledContent("容量采样", value: model.isFresh ? "最近 3 分钟有新记录" : "最近 3 分钟没有新记录，请检查后台")
                 LabeledContent("界面刷新", value: "每 15 秒读取；⌘R 可手动刷新")
                 LabeledContent("历史数据占用", value: bytes(model.databaseBytes))
@@ -405,6 +417,8 @@ private struct HealthView: View {
                         HStack {
                             Label(shortPath(path), systemImage: "folder").textSelection(.enabled)
                             Spacer()
+                            Text(model.paused ? "已暂停" : (model.rootStates[path]?.state.readable ?? "等待记录"))
+                                .font(.caption).foregroundStyle(.secondary)
                             Button("Finder") { model.reveal(path) }.buttonStyle(.borderless)
                         }
                     }
@@ -431,6 +445,7 @@ private struct HealthView: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
+    @StateObject private var background = BackgroundServiceController()
     var body: some View {
         Form {
             Section("历史数据位置") {
@@ -439,12 +454,33 @@ struct SettingsView: View {
                 Text("界面只读取历史，不修改或清理数据库。修改路径不会改变后台监控的写入位置。")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Section("后台服务") {
+                Text(background.statusText)
+                HStack {
+                    Button("启用登录后台") { background.enable() }
+                    Button("停用登录后台") { Task { await background.disable() } }
+                    Button("打开系统后台设置") { background.openApproval() }
+                }
+                if let message = background.message { Text(message).font(.caption) }
+            }
+            Section("监控与提醒") {
+                HStack {
+                    Button("暂停扫描") { Task { await model.sendControl(.pause) } }
+                    Button("恢复扫描") { Task { await model.sendControl(.resume) } }
+                    Button("立即校准") { Task { await model.sendControl(.calibrate) } }
+                }.disabled(model.controlPending)
+                HStack {
+                    Button("授权系统提醒") { Task { await model.sendControl(.authorizeNotifications) } }
+                    Button("发送测试提醒") { Task { await model.sendControl(.notificationTest) } }
+                }.disabled(model.controlPending)
+                if let message = model.controlMessage { Text(message).font(.caption) }
+            }
             Section("刷新与监控") {
                 Text("界面每 15 秒刷新；本机后台约每 60 秒采样、每 15 分钟校准目录。")
                 Text("监控范围和采样间隔目前由本地启动配置管理，尚不能在界面中修改。")
                     .font(.caption).foregroundStyle(.secondary)
             }
-        }.formStyle(.grouped).padding().frame(width: 580, height: 340)
+        }.formStyle(.grouped).padding().frame(width: 680, height: 640)
     }
 }
 

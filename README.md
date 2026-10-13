@@ -70,25 +70,29 @@ The agent entry point accepts `--db <path>`, `--root <path>` (repeatable), `--ex
 
 Details and raw evidence: [`docs/TECHNICAL_GATES.md`](docs/TECHNICAL_GATES.md), [`docs/REUSE_AUDIT.md`](docs/REUSE_AUDIT.md), `artifacts/evidence/`.
 
-## 原始需求闭环（本轮实现）
+## 原始需求进度与本地修复
 
-在原有卷级/目录监控之上，本轮补齐了「变化 → 具体文件 → 原因候选 → 提醒」的闭环：
+已有容量历史、具体文件差分、任务候选与提醒基础设施；**尚未完整实现可靠定位到某次 Agent 任务的原始目标**。常规文件事实来自扫描窗口，实时逐路径差分与真实客户端验证仍未完成。
 
 - **具体文件事实**：流式 `MetadataProbe`/`StreamingScanner` 建立有界的当前文件索引代次，代次差分产生
   `file_changes`（added/grown/shrunk/removed/replaced/moved），前值未知写 NULL，绝不写 0 冒充（ADR-10）。
-- **真实 Codex 任务窗口**：`session_meta` / `event_msg.payload.type` 事件信封、`turn_id`、字节级白名单元数据
+- **Codex 任务元数据解析**：`session_meta` / `event_msg.payload.type` 事件信封、`turn_id`、字节级白名单元数据
   （正文不解码）、完整行游标 + 跨重启恢复 + 任务状态机 + 公平调度。
 - **可核验关联**：`EventAssembler` 按 (root, scope, 5 分钟桶) 聚合事件，`AttributionPolicy` 按验证状态/路径/时间
   打候选；时间或目录重合不升级 `agentConfirmed`；未验证客户端不发 Agent 主动提醒。
 - **系统提醒链路**：持久 `notification_outbox`（幂等 ID）、冷却、quiet hours、到期；`UNUserNotificationCenter` sink
   位于嵌入式 `DiskTraceAgentApp`（真实送达未验证）。
 - **中文只读 UI 闭环**：侧栏「空间概览 / 文件与事件 / 目录变化 / 监控状态」，事件 → 具体文件 → 任务候选 → Finder，
-  含 partial / detailExpired / permissionDenied / quotaLimited 视觉状态。
+  含未知测量值、文件分页、命令回执和各监控目录状态。
 - **自限**：有界 FSEvents 队列、库存行/字节预算、软/硬配额、低空间暂停新索引、WAL checkpoint 重试。
 
 验收分级（工程/本机/真实客户端/登录恢复/发布）与逐项证据见
 [`docs/ORIGINAL_NEED_ACCEPTANCE.md`](docs/ORIGINAL_NEED_ACCEPTANCE.md)；启停/配置/迁移/回退见
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)。**真实客户端、系统通知、登录恢复、24 小时资源为 NOT RUN，发布未就绪。**
+
+本轮先按执行文档修复，再在用户 Mac 上备份升级并运行；最终全量 110 项通过。
+执行与真机结果见 [`REPAIR_EXECUTION_2191371.md`](docs/implementation/REPAIR_EXECUTION_2191371.md) 和
+[`REPAIR_RESULT_20261013.md`](docs/implementation/REPAIR_RESULT_20261013.md)。
 
 ## Privacy
 

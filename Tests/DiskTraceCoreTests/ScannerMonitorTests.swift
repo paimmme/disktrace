@@ -73,7 +73,7 @@ struct FixtureScannerTests {
 
 @Suite("Monitor coordinator (integration)")
 struct MonitorCoordinatorTests {
-    @Test("records silent deltas, then alerts when an agent activity overlaps")
+    @Test("wide calibrations stay silent even when an unverified agent overlaps")
     func endToEndAttribution() async throws {
         let root = try tempDirectory("monitor")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -107,8 +107,8 @@ struct MonitorCoordinatorTests {
                 windowIsTaskBounded: true))
         try writeFile(root.appending(path: "growth-b.bin"), bytes: 200_000)
         let second = try await coordinator.runOnce()
-        #expect(second.decisions.contains { $0.action == .notifyAgentAnomaly })
-        #expect(second.decisions.contains { $0.evidenceClass == .agentProbable })
+        #expect(second.decisions.allSatisfy { $0.action == .silent })
+        #expect(second.decisions.allSatisfy { $0.evidenceClass == .unknown })
     }
 
     @Test("unavailable scanner records a coverage gap instead of fabricating data")

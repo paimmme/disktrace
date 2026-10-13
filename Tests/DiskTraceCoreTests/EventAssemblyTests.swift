@@ -17,7 +17,7 @@ private func change(
         identityAfter: "id", kind: kind, windowStart: t0, windowEnd: t0.addingTimeInterval(60),
         observedAt: date, beforeLogical: nil, afterLogical: nil, beforeAllocated: nil,
         afterAllocated: delta, deltaAllocated: delta, measurement: .measured,
-        timing: .scanWindow, evidenceVersion: 1)
+        timing: .liveHintWindow, evidenceVersion: 1)
 }
 
 private func activity(id: UUID, cwd: String, start: Date = t0, end: Date? = t0.addingTimeInterval(50), bounded: Bool = true) -> AgentActivity {

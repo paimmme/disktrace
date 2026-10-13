@@ -14,6 +14,7 @@ struct EventsView: View {
                 emptyState
             } else {
                 eventList
+                if model.hasMoreEvents { Button("加载更多事件") { Task { await model.loadMoreEvents() } } }
                 if let id = model.selectedEventID, let event = events.first(where: { $0.id == id }) {
                     Divider()
                     EventDetail(event: event)
@@ -60,7 +61,7 @@ private struct EventRow: View {
             }
             Spacer(minLength: 12)
             VStack(alignment: .trailing, spacing: 4) {
-                Text(signedBytes(event.netBytes ?? 0))
+                Text(event.netBytes.map(signedBytes) ?? "未知")
                     .font(.body.monospacedDigit())
                     .foregroundStyle((event.netBytes ?? 0) >= 0 ? Color.orange : Color.green)
                 HStack(spacing: 6) {
@@ -107,9 +108,9 @@ private struct EventDetail: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(shortPath(event.scopePath)).font(.headline)
             HStack(spacing: 16) {
-                metric("已测净变化", signedBytes(event.netBytes ?? 0))
-                metric("新增", signedBytes(event.grossAddedBytes ?? 0))
-                metric("释放", signedBytes(event.grossRemovedBytes ?? 0))
+                metric("已测净变化", event.netBytes.map(signedBytes) ?? "未知")
+                metric("新增", event.grossAddedBytes.map(signedBytes) ?? "未知")
+                metric("释放", event.grossRemovedBytes.map(signedBytes) ?? "未知")
                 metric("候选任务", "\(event.candidateCount)")
             }
             Text("时间窗 \(event.windowStart.formatted(date: .abbreviated, time: .shortened)) – \(event.windowEnd.formatted(date: .abbreviated, time: .shortened)) · 测量 \(measurementText(event.measurement))")
@@ -121,8 +122,13 @@ private struct EventDetail: View {
                 Button {
                     model.confirmEvent(event.id)
                 } label: { Label("这是我主动操作", systemImage: "hand.raised") }
-                .help("确认只是你自己操作：不删除历史，只静默该范围的通知。")
+                .disabled(model.controlPending)
+                .help("仅确认这个事件；后台回执后生效，不删除文件。")
+                if event.attributionClass == .userConfirmed {
+                    Button("撤销确认") { Task { await model.sendControl(.revokeUser, eventID: event.id) } }.disabled(model.controlPending)
+                }
             }
+            if let message = model.controlMessage { Text(message).font(.caption).foregroundStyle(.secondary) }
         }
     }
 
@@ -136,7 +142,7 @@ private struct EventDetail: View {
     private var fileTable: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("具体文件（\(model.eventFiles.count)）").font(.subheadline.weight(.semibold))
-            ForEach(model.eventFiles.prefix(100)) { change in
+            ForEach(model.eventFiles) { change in
                 HStack(alignment: .top, spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(shortPath(change.displayPath)).font(.callout).lineLimit(1).truncationMode(.middle)
@@ -150,7 +156,7 @@ private struct EventDetail: View {
                     }
                     Spacer(minLength: 10)
                     VStack(alignment: .trailing, spacing: 2) {
-                        Text(signedBytes(change.deltaAllocated ?? 0)).font(.callout.monospacedDigit())
+                        Text(change.deltaAllocated.map(signedBytes) ?? "未知").font(.callout.monospacedDigit())
                         Text("前 \(change.beforeAllocated.map(bytes) ?? "未知") → 后 \(change.afterAllocated.map(bytes) ?? "未知")")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
@@ -160,6 +166,7 @@ private struct EventDetail: View {
                 .padding(.vertical, 3)
                 Divider()
             }
+            if model.hasMoreFiles { Button("加载更多文件") { Task { await model.loadMoreFiles() } } }
         }
     }
 

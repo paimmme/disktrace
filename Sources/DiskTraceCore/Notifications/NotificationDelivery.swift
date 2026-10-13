@@ -181,12 +181,12 @@ public enum NotificationCopy {
     ) -> String {
         switch category {
         case .lowSpaceSafety:
-            return "剩余 \(bytesText(freeBytes ?? 0))。点击查看近期增长目录。"
+            return "剩余 \(freeBytes.map(bytesText) ?? "未知")。点击查看近期增长目录。"
         case .criticalLowSpace:
-            return "剩余 \(bytesText(freeBytes ?? 0))。部分增长尚未找到原因。"
+            return "剩余 \(freeBytes.map(bytesText) ?? "未知")。部分增长尚未找到原因。"
         case .agentGrowth:
             let name = scopeName.map { detail ? shortPath($0) : URL(filePath: $0).lastPathComponent } ?? "某目录"
-            return "可能与 Codex 任务有关：\(name) 在相关时段净增 \(bytesText(netBytes ?? 0))。点击查看文件与证据。"
+            return "可能与 Codex 任务有关：\(name) 在相关时段净增 \(netBytes.map(bytesText) ?? "未知")。点击查看文件与证据。"
         }
     }
     static func bytesText(_ value: Int64) -> String {

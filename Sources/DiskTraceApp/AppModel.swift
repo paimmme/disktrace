@@ -41,6 +41,14 @@ final class AppModel: ObservableObject {
     @Published var eventFiles: [FileChange] = []
     @Published var eventLinks: [TaskLink] = []
     @Published var eventPresence: [PresenceCheck] = []
+    @Published var controlMessage: String?
+    @Published var controlPending = false
+    @Published var rootStates: [String: RootHealth] = [:]
+    @Published var paused = false
+    @Published var heartbeat: Date?
+    @Published var hasMoreEvents = false
+    @Published var hasMoreFiles = false
+    private var eventsTo = Date()
     private var store: DiskTraceStore?
     private var openedPath: String?
 
@@ -108,13 +116,23 @@ final class AppModel: ObservableObject {
             let loadedDecisions = try await store.decisions(from: from, to: now)
             let loadedGaps = try await store.coverageGaps(from: from)
             let counts = try await store.rowCounts()
+            var health: [String: RootHealth] = [:]
+            for root in try await store.roots() {
+                if let state = try await store.rootHealth(rootID: root.id) { health[root.canonicalPath] = state }
+            }
+            rootStates = health
+            paused = try await store.state("paused") == "true"
+            heartbeat = (try await store.state("heartbeat_at")).flatMap(Double.init).map { Date(timeIntervalSince1970: $0) }
             let space = await store.spaceReport()
             // The local runner supplies its actual roots. A different database has unknown configuration.
             var loadedRoots: [String] = []
-            if databasePath == Self.defaultDatabasePath(),
-               let data = try? Data(contentsOf: URL(filePath: databasePath).deletingLastPathComponent().appending(path: "local-run.json")),
-               let config = try? JSONDecoder().decode(LocalConfiguration.self, from: data) {
-                loadedRoots = config.roots
+            if databasePath == Self.defaultDatabasePath() {
+                for name in ["config.json", "local-run.json"] {
+                    if let data = try? Data(contentsOf: URL(filePath: databasePath).deletingLastPathComponent().appending(path: name)),
+                       let config = try? JSONDecoder().decode(LocalConfiguration.self, from: data) {
+                        loadedRoots = config.roots; break
+                    }
+                }
             }
             latestSample = recent.last
             let volume = latestSample?.volumeID
@@ -141,14 +159,21 @@ final class AppModel: ObservableObject {
     /// Loads user-facing events for the selected range (read-only, paged).
     func loadEvents(from: Date, to: Date) async {
         guard let store else { events = []; return }
-        events = (try? await store.queryEvents(rootID: nil, from: from, to: to, limit: 200)) ?? []
+        eventsTo = to
+        do {
+            events = try await store.queryEvents(rootID: nil, from: from, to: to, limit: 100)
+            hasMoreEvents = events.count == 100
+        } catch { errorMessage = "事件读取失败：\(error)" }
     }
 
     /// Loads the file detail, task candidates and presence state of one event.
     func selectEvent(_ id: UUID) async {
         guard let store else { return }
         selectedEventID = id
-        eventFiles = (try? await store.queryFileChanges(eventID: id, limit: 200)) ?? []
+        do {
+            eventFiles = try await store.queryFileChanges(eventID: id, limit: 100)
+            hasMoreFiles = eventFiles.count == 100
+        } catch { eventFiles = []; errorMessage = "文件明细读取失败：\(error)"; return }
         eventLinks = (try? await store.queryTaskCandidates(eventID: id)) ?? []
         var presence: [PresenceCheck] = []
         for change in eventFiles {
@@ -161,10 +186,52 @@ final class AppModel: ObservableObject {
         eventPresence.filter { $0.changeID == changeID }.max { $0.scheduledAt < $1.scheduledAt }
     }
 
-    func confirmEvent(_ id: UUID) {
-        // Feedback is applied by the Agent via a control request; the read-only UI
-        // records the intent locally and the Agent confirms it on the next cycle.
-        Task { await selectEvent(id) }
+    func openEvent(_ id: UUID) async {
+        guard let store, let event = try? await store.event(id: id) else {
+            errorMessage = "该提醒的事件已过期或明细已清理。"; return
+        }
+        if !events.contains(where: { $0.id == id }) { events.insert(event, at: 0) }
+        await selectEvent(id)
+    }
+
+    func loadMoreEvents() async {
+        guard let store, let last = events.last else { return }
+        let more = (try? await store.queryEvents(rootID: nil, from: eventsTo.addingTimeInterval(-range.seconds), to: eventsTo,
+            limit: 100, before: last.windowEnd, beforeID: last.id)) ?? []
+        events += more; hasMoreEvents = more.count == 100
+    }
+
+    func loadMoreFiles() async {
+        guard let store, let id = selectedEventID else { return }
+        let more = (try? await store.queryFileChanges(eventID: id, limit: 100, offset: eventFiles.count)) ?? []
+        eventFiles += more; hasMoreFiles = more.count == 100
+        for change in more { eventPresence += (try? await store.presenceChecks(changeID: change.id)) ?? [] }
+    }
+
+    func confirmEvent(_ id: UUID) { Task { await sendControl(.confirmUser, eventID: id) } }
+
+    func sendControl(_ command: ControlCommand, eventID: UUID? = nil) async {
+        guard !controlPending else { return }
+        guard databasePath == Self.defaultDatabasePath() else {
+            controlMessage = "历史数据库只支持查看；请切回本机数据库后操作。"; return
+        }
+        controlPending = true; defer { controlPending = false }
+        let support = URL(filePath: databasePath).deletingLastPathComponent()
+        let request = ControlRequest(command: command, eventID: eventID)
+        do {
+            try ControlFiles.submit(request, support: support)
+            controlMessage = "等待后台确认…"
+            for _ in 0..<40 {
+                try await Task.sleep(for: .milliseconds(250))
+                if let receipt = ControlFiles.receipt(request.id, support: support) {
+                    controlMessage = receipt.detail
+                    await refresh()
+                    if let eventID { await selectEvent(eventID) }
+                    return
+                }
+            }
+            controlMessage = "后台尚未回执。请求将在一分钟后失效；请检查后台是否运行。"
+        } catch { controlMessage = "请求未完成：\(error)" }
     }
 
     func reveal(_ path: String) {
@@ -232,6 +299,7 @@ extension CoverageGapCause {
         case .fseventsOverflow: return "文件事件过多，部分线索丢失"
         case .eventIDUnavailable: return "事件历史不可恢复"
         case .permissionDenied: return "部分目录没有读取权限"
+        case .resourceLimited: return "低空间或库存预算限制，扫描暂停"
         case .manualPause: return "监控曾被暂停"
         case .scannerUnavailable: return "目录扫描暂不可用"
         case .logRotation: return "会话日志被替换或截断"
@@ -240,6 +308,21 @@ extension CoverageGapCause {
         case .schemaMissingTaskID: return "任务事件缺少标识，未建立任务窗口"
         case .clockDiscontinuity: return "系统时钟变化，窗口时长可能不准"
         case .malformedRecord: return "部分会话记录格式异常，已安全跳过"
+        }
+    }
+}
+
+extension RootState {
+    var readable: String {
+        switch self {
+        case .pending: return "等待初始扫描"
+        case .scanning: return "扫描中"
+        case .ready: return "基线有效"
+        case .needsRebaseline: return "需要重新建立基线"
+        case .permissionDenied: return "读取权限不足"
+        case .quotaLimited: return "库存预算或低空间限制"
+        case .paused: return "已暂停"
+        case .unavailable: return "扫描不可用"
         }
     }
 }

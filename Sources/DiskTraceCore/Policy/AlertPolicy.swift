@@ -81,6 +81,11 @@ public enum AlertPolicy {
         // User-facing storage events.
         if case .event(let event) = observation {
             let key = "event:\(event.scopePath)"
+            if let suppressingRule {
+                return AlertDecision(ruleVersion: policyVersion, subjectID: event.id, action: .silent,
+                    reason: suppressingRule.kind == .confirmUser ? .userExpectedActivity : .userRuleSuppressed,
+                    evidenceClass: .userConfirmed, evaluatedAt: now)
+            }
             switch event.attributionClass {
             case .agentProbable, .agentConfirmed:
                 let net = event.netBytes ?? 0

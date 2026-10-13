@@ -54,6 +54,7 @@ struct StreamingScanner {
                 entryCount: 0, directoryCount: 0,
                 checkpointID: FSEventCheckpoint.currentEventID(), termination: .storageError)
         }
+        defer { for frame in stack { closedir(frame.dir) } }
         stack.append(Frame(path: rootPath, dir: rootDir))
         directoryCount = 1
 
@@ -72,6 +73,7 @@ struct StreamingScanner {
             let top = stack[stack.count - 1]
             let dirent = readdir(top.dir)
             if dirent == nil {
+                stack.removeLast()
                 closedir(top.dir)
                 let totalAllocated = top.ownAllocated + top.subtreeAllocated
                 let totalFiles = top.ownFiles + top.subtreeFiles
@@ -79,7 +81,6 @@ struct StreamingScanner {
                     .directory(
                         DirectorySize(
                             path: top.path, allocatedBytes: totalAllocated, fileCount: totalFiles)))
-                stack.removeLast()
                 if let parent = stack.last {
                     parent.subtreeAllocated += totalAllocated
                     parent.subtreeFiles += totalFiles
@@ -140,8 +141,6 @@ struct StreamingScanner {
                 break
             }
         }
-
-        for frame in stack { closedir(frame.dir) }
 
         return ScanCompletion(
             root: rootPath, startedAt: started, endedAt: Date(), complete: complete,

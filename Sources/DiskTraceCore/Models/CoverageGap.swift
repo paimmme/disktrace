@@ -6,6 +6,7 @@ public enum CoverageGapCause: String, Codable, Sendable {
     case fseventsOverflow
     case eventIDUnavailable
     case permissionDenied
+    case resourceLimited
     case manualPause
     case scannerUnavailable
     /// A session log was truncated, replaced or rotated, so the sync cursor was

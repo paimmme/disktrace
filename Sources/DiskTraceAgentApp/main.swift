@@ -7,12 +7,24 @@ import UserNotifications
 /// only jobs are (a) to own a real notification identity and (b) to run the same
 /// `MonitorCoordinator` as the CLI. It never opens a main window and never takes
 /// the Dock. Only one writer may run against the database (flock).
-final class AgentAppDelegate: NSObject, NSApplicationDelegate {
+final class AgentAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var task: Task<Void, Never>?
+    private var signals: AgentSignalHandler?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        UNUserNotificationCenter.current().delegate = self
         task = Task.detached(priority: .background) { await AgentAppDelegate.run() }
+        let running = task
+        signals = AgentSignalHandler { running?.cancel() }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let id = response.notification.request.content.userInfo["eventID"] as? String
+        let destination = id.flatMap(UUID.init(uuidString:)).map { "disktrace://event/" + $0.uuidString } ?? "disktrace://overview"
+        if let url = URL(string: destination) { NSWorkspace.shared.open(url) }
+        completionHandler()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -64,7 +76,23 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
                 return roots.map { URL(filePath: ($0 as NSString).expandingTildeInPath) }
             }
         }
-        return [FileManager.default.homeDirectoryForCurrentUser]
+        return []
+    }
+
+    static func configuration(from support: URL) -> MonitorConfig {
+        var values: [String: Any] = [:]
+        for name in ["config.json", "local-run.json"] {
+            if let data = try? Data(contentsOf: support.appending(path: name)),
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { values = object; break }
+        }
+        let sample = values["sampleSeconds"] as? Double ?? 60
+        let calibration = values["calibrationSeconds"] as? Double ?? 900
+        return MonitorConfig(roots: roots(from: support),
+            exclusions: (values["exclusions"] as? [String] ?? []) + [support.path],
+            sampleInterval: sample.isFinite && sample > 0 ? sample : 60,
+            calibrationInterval: calibration.isFinite && calibration > 0 ? calibration : 900,
+            inventoryRowBudget: max(1, min(values["inventoryRowBudget"] as? Int ?? 200_000, 1_000_000)),
+            inventoryByteBudget: max(1, min(values["inventoryByteBudget"] as? Int64 ?? 192_000_000, 256_000_000)))
     }
 
     static func run() async {
@@ -73,35 +101,30 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate {
             at: support, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
         let dbURL = support.appending(path: "disktrace.sqlite")
-        let lock: SingleWriterLock
         do {
-            lock = try SingleWriterLock(path: support.appending(path: "agent.lock").path)
-        } catch {
-            FileHandle.standardError.write(Data("disktrace-agent: another writer is running\n".utf8))
-            exit(1)
-        }
-        defer { lock.release() }
-
-        do {
-            let store = try DiskTraceStore(path: dbURL.path)
-            let roots = roots(from: support)
-            let coordinator = MonitorCoordinator(
-                config: MonitorConfig(roots: roots), store: store,
-                scanner: FixtureScanner(), scannerName: "fixture",
-                activitySync: AgentActivitySync())
-            let dispatcher = NotificationDispatcher(
-                config: NotificationConfig(), sink: SystemNotificationSink())
-            try await coordinator.start()
-            while !Task.isCancelled {
-                _ = try? await coordinator.runOnce()
-                _ = await dispatcher.flush(store: store, now: Date())
-                try? await Task.sleep(for: .seconds(15))
-            }
-            await coordinator.stop()
-        } catch {
+            try await AgentRuntime.run(databaseURL: dbURL,
+                config: configuration(from: support),
+                dispatcher: NotificationDispatcher(config: NotificationConfig(), sink: SystemNotificationSink()),
+                nativeCommand: { command in
+                    let center = UNUserNotificationCenter.current()
+                    if command == .authorizeNotifications {
+                        let allowed = try await center.requestAuthorization(options: [.alert])
+                        return allowed ? "系统通知已授权" : "系统通知未授权，请在系统设置中开启"
+                    }
+                    let settings = await center.notificationSettings()
+                    guard settings.authorizationStatus == .authorized else { throw CocoaError(.featureUnsupported) }
+                    let content = UNMutableNotificationContent()
+                    content.title = "DiskTrace 测试提醒"
+                    content.body = "后台提醒通道已提交给系统。此消息不代表发现磁盘异常。"
+                    try await center.add(UNNotificationRequest(identifier: "disktrace-user-test", content: content, trigger: nil))
+                    return "测试提醒已提交给系统"
+                })
+        } catch is CancellationError { }
+        catch {
             FileHandle.standardError.write(Data("disktrace-agent fatal: \(error)\n".utf8))
-            exit(1)
         }
+        await MainActor.run { NSApp.terminate(nil) }
+
     }
 }
 

@@ -7,7 +7,9 @@ import Foundation
 /// append-only — decisions and rules never delete them.
 public actor DiskTraceStore {
     let database: SQLiteDatabase
+    var inventoryBudgetCache: (scanID: UUID, rows: Int, bytes: Int64)?
     private let databasePath: String?
+    var databaseFilePath: String? { databasePath }
 
     public init(path: String, readOnly: Bool = false) throws {
         let database = try SQLiteDatabase(path: path, readOnly: readOnly)
@@ -692,11 +694,6 @@ public actor DiskTraceStore {
             if batch == 0 { break }
             deleted += batch
             let next = spaceReport()
-            if next.effectiveBytes >= space.effectiveBytes && next.pageCount == space.pageCount {
-                // No progress from deletion (e.g. all rows protected); stop.
-                space = next
-                break
-            }
             space = next
         }
         return deleted

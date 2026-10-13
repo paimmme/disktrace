@@ -21,14 +21,35 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Validate before touching an existing output. Build only in a unique staging.
+OUTPUT="$(python3 - "$OUTPUT" <<'PYVALIDATE'
+import sys, pathlib, plistlib
+p=pathlib.Path(sys.argv[1]).absolute()
+if p.suffix != '.app' or any(x.is_symlink() for x in [p,*p.parents]):
+    raise SystemExit('Refusing non-.app output or symlink path')
+repo=pathlib.Path.cwd().resolve()
+if p == repo or p in repo.parents or p == pathlib.Path.home():
+    raise SystemExit('Refusing repository/home/ancestor output')
+if p.exists():
+    try:
+        info=plistlib.loads((p/'Contents/Info.plist').read_bytes())
+        assert info.get('CFBundleIdentifier')=='local.disktrace.app'
+    except Exception: raise SystemExit('Existing output is not the DiskTrace app; preserving it')
+print(p)
+PYVALIDATE
+)"
+if [ "${DISKTRACE_VALIDATE_OUTPUT_ONLY:-0}" = "1" ]; then echo "$OUTPUT"; exit 0; fi
 source scripts/toolchain-env.sh >/dev/null 2>&1
 echo "== building ($CONFIG) =="
 swift build -c "$CONFIG"
 BIN=".build/$CONFIG"
 
-APP="$OUTPUT"
+PARENT="$(dirname "$OUTPUT")"
+mkdir -p "$PARENT"
+STAGING="$(mktemp -d "$PARENT/.disktrace-package.XXXXXX")"
+trap 'if [[ "$STAGING" == "$PARENT"/.disktrace-package.* ]]; then rm -rf -- "$STAGING"; fi' EXIT
+APP="$STAGING/DiskTrace Local.app"
 AGENT_APP="$APP/Contents/Library/LoginItems/DiskTraceAgent.app"
-rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 mkdir -p "$AGENT_APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Library/LaunchAgents"
@@ -44,8 +65,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>DiskTrace</string>
   <key>CFBundleExecutable</key><string>DiskTraceApp</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.2.1</string>
+  <key>CFBundleVersion</key><string>2</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>CFBundleURLTypes</key><array><dict>
     <key>CFBundleURLName</key><string>local.disktrace.event</string>
@@ -62,8 +83,8 @@ cat > "$AGENT_APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>DiskTraceAgent</string>
   <key>CFBundleExecutable</key><string>DiskTraceAgent</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.2.1</string>
+  <key>CFBundleVersion</key><string>2</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
 </dict></plist>
@@ -101,6 +122,14 @@ if ! codesign --verify --deep --strict --verbose=2 "$APP"; then
   exit 1
 fi
 codesign -dvvv "$APP" 2>&1 | sed -n '1,12p'
-echo "packaged: $APP"
+if [ -e "$OUTPUT" ]; then
+  BACKUP="${OUTPUT%.app}.previous-$(date -u +%Y%m%dT%H%M%SZ)-$$.app"
+  mv -- "$OUTPUT" "$BACKUP"
+  if ! mv -- "$APP" "$OUTPUT"; then mv -- "$BACKUP" "$OUTPUT"; exit 1; fi
+  echo "previous app preserved: $BACKUP"
+else
+  mv -- "$APP" "$OUTPUT"
+fi
+echo "packaged: $OUTPUT"
 echo "NOTE: ad-hoc ('-') signature is for LOCAL use only; distribution requires a"
 echo "      Developer ID identity, hardened runtime and notarization."

@@ -11,11 +11,12 @@ public struct MonitorConfig: Sendable {
     public var retentionInterval: TimeInterval
     /// Bound on the coalesced change queue.
     public var changeCapacity: Int
-    /// Bound on rows staged into one file-inventory generation.
+    /// Global rows across all roots and active/preparing inventory generations.
     public var inventoryRowBudget: Int
-    /// Bound on bytes of one file-inventory generation.
+    /// Global estimated inventory and directory-summary bytes, including indexes.
     public var inventoryByteBudget: Int64
     public var scanLimits: ScanLimits
+    public var hardTotalBytes: Int64 = 512_000_000
     public var configRevision: Int
     public var policy: AlertPolicyConfig
     public var retention: RetentionPolicy
@@ -95,6 +96,9 @@ public actor MonitorCoordinator {
     private var running = false
     private var openGaps: [CoverageGap] = []
     private var completedFirstCalibration = false
+    private var scanEpoch = 0
+    private var paused = false
+    private var pauseGap: CoverageGap?
 
     /// Low-space behaviour ladder. Volume sampling and neutral safety alerts are
     /// never suspended; only the expensive inventory work sheds load.
@@ -142,9 +146,8 @@ public actor MonitorCoordinator {
         changeMonitor = monitor
         running = true
 
-        if let (volume, method) = try? await sampleVolume() {
-            _ = try? await recordVolumeDecision(volume, method: method, now: timeSource.now())
-        }
+        if try await store.state("paused") == "true" { paused = true }
+        try? await sampleIfDue()
         if let activitySync {
             _ = await activitySync.sync(store: store, now: timeSource.now())
         }
@@ -153,6 +156,12 @@ public actor MonitorCoordinator {
         // calibration picks up any changes as a recovery window instead.
         var startChanges: [FileChange] = []
         for root in config.roots {
+            if paused { break }
+            if resourceMode() != .normal {
+                let record = try await store.ensureRoot(canonicalPath: FilePaths.canonical(root.path), volumeID: nil, configRevision: config.configRevision, at: timeSource.now())
+                try await store.markRootState(rootID: record.id, state: .quotaLimited)
+                continue
+            }
             let rootID = MonitoredRoot.stableID(canonicalPath: FilePaths.canonical(root.path))
             if await validActiveGeneration(rootID: rootID) { continue }
             do {
@@ -162,6 +171,10 @@ public actor MonitorCoordinator {
                     startChanges.append(contentsOf: published.fileChanges)
                     _ = try await evaluate(deltas: published.directoryDeltas, now: timeSource.now())
                 }
+                lastCalibrationByRoot[FilePaths.canonical(root.path)] = timeSource.now()
+            } catch is CancellationError {
+                if Task.isCancelled { throw CancellationError() }
+                break
             } catch is ScannerUnavailableError {
                 let gap = CoverageGap(
                     start: timeSource.now(), cause: .scannerUnavailable,
@@ -192,12 +205,12 @@ public actor MonitorCoordinator {
 
     /// One monitoring cycle. Safe to call on a timer; returns what it recorded.
     @discardableResult
-    public func runOnce() async throws -> CycleReport {
+    public func runOnce(sampleCapacity: Bool = true) async throws -> CycleReport {
         let now = timeSource.now()
         var report = CycleReport()
 
         // 1. Volume sampling (never blocked by attribution work).
-        if lastSample == nil || now.timeIntervalSince(lastSample!) >= config.sampleInterval {
+        if sampleCapacity && (lastSample == nil || now.timeIntervalSince(lastSample!) >= config.sampleInterval) {
             if let (sample, method) = try? await sampleVolume() {
                 report.sample = sample
                 let decision = try await recordVolumeDecision(sample, method: method, now: now)
@@ -205,6 +218,7 @@ public actor MonitorCoordinator {
             }
         }
 
+        if paused { return report }
         // 2. Drain and persist change hints; overflow becomes a coverage gap.
         if let output = changeMonitor?.drain() {
             report.changeCount = output.hints.count
@@ -232,6 +246,7 @@ public actor MonitorCoordinator {
         if mode == .normal {
             let timing: TimingPrecision = completedFirstCalibration ? .scanWindow : .recoveryWindow
             for root in config.roots {
+                if paused || Task.isCancelled { break }
                 let key = FilePaths.canonical(root.path)
                 let last = lastCalibrationByRoot[key]
                 let due = last == nil || now.timeIntervalSince(last!) >= config.calibrationInterval
@@ -267,7 +282,7 @@ public actor MonitorCoordinator {
             }
             report.gaps.append(
                 CoverageGap(
-                    start: now, cause: .permissionDenied,
+                    start: now, cause: .resourceLimited,
                     affectedRoots: config.roots.map(\.path), severity: .low))
         }
 
@@ -332,7 +347,7 @@ public actor MonitorCoordinator {
 
     // MARK: - Streaming scan → staged generation → publish
 
-    private final class ScanStager: @unchecked Sendable {
+    private actor ScanStager {
         let store: DiskTraceStore
         let rootID: UUID
         let scanID: UUID
@@ -341,13 +356,17 @@ public actor MonitorCoordinator {
         var files: [FileMetadata] = []
         var directories: [DirectorySize] = []
         var rows = 0
+        let byteBudget: Int64
+        let hardTotal: Int64
 
-        init(store: DiskTraceStore, rootID: UUID, scanID: UUID, batchSize: Int, rowBudget: Int) {
+        init(store: DiskTraceStore, rootID: UUID, scanID: UUID, batchSize: Int, rowBudget: Int, byteBudget: Int64, hardTotal: Int64) {
             self.store = store
             self.rootID = rootID
             self.scanID = scanID
             self.batchSize = batchSize
             self.rowBudget = rowBudget
+            self.byteBudget = byteBudget
+            self.hardTotal = hardTotal
         }
 
         func add(_ entry: ScanEntry) async throws {
@@ -365,15 +384,15 @@ public actor MonitorCoordinator {
             rows += files.count
             let batch = files
             files.removeAll(keepingCapacity: true)
-            try await store.stageInventory(rootID: rootID, scanID: scanID, files: batch)
-            if rows > rowBudget { throw ScanBudgetExceeded() }
+            try await store.stageBudgetedInventory(rootID: rootID, scanID: scanID, files: batch,
+                maximumRows: rowBudget, maximumBytes: byteBudget, hardTotalBytes: hardTotal)
         }
 
         func flushDirectories() async throws {
             guard !directories.isEmpty else { return }
             let batch = directories
             directories.removeAll(keepingCapacity: true)
-            try await store.stageDirectorySummaries(scanID: scanID, summaries: batch)
+            try await store.stageBudgetedDirectories(scanID: scanID, summaries: batch, maximumBytes: byteBudget, hardTotalBytes: hardTotal)
         }
 
         func flush() async throws {
@@ -385,6 +404,7 @@ public actor MonitorCoordinator {
     private func scanAndPublish(
         root: URL, now: Date, timing: TimingPrecision = .scanWindow
     ) async throws -> PublishResult? {
+        let epoch = scanEpoch
         let canonical = FilePaths.canonical(root.path)
         let volumeID = (try? sampler.sample(url: root, at: now))?.volumeID
         let rootRecord = try await store.ensureRoot(
@@ -393,14 +413,17 @@ public actor MonitorCoordinator {
         let scanID = try await store.beginScan(rootID: rootRecord.id, startEventID: nil, at: now)
         let stager = ScanStager(
             store: store, rootID: rootRecord.id, scanID: scanID,
-            batchSize: config.scanLimits.batchSize, rowBudget: config.inventoryRowBudget)
+            batchSize: config.scanLimits.batchSize, rowBudget: config.inventoryRowBudget,
+            byteBudget: config.inventoryByteBudget, hardTotal: config.hardTotalBytes)
         do {
             let completion = try await scanner.scanEntries(
                 root: root, excluding: config.exclusions, limits: config.scanLimits
             ) { entry in
+                if await !self.scanIsValid(epoch) || Task.isCancelled { throw CancellationError() }
                 try await stager.add(entry)
             }
             try await stager.flush()
+            guard scanIsValid(epoch) else { throw CancellationError() }
             if completion.complete {
                 return try await store.publishScan(
                     rootID: rootRecord.id, scanID: scanID, at: timeSource.now(), complete: true,
@@ -414,17 +437,54 @@ public actor MonitorCoordinator {
                 rootID: rootRecord.id, scanID: scanID, reason: completion.termination.rawValue,
                 state: .needsRebaseline, at: timeSource.now())
             return nil
-        } catch is ScanBudgetExceeded {
+        } catch is InventoryBudgetError {
             let gap = CoverageGap(
-                start: now, cause: .permissionDenied, affectedRoots: [canonical], severity: .medium)
+                start: now, cause: .resourceLimited, affectedRoots: [canonical], severity: .medium)
             openGaps.append(gap)
             try? await store.insert(gap)
             try? await store.failScan(
                 rootID: rootRecord.id, scanID: scanID, reason: "quotaLimited",
                 state: .quotaLimited, at: timeSource.now())
             return nil
+        } catch {
+            try? await store.failScan(rootID: rootRecord.id, scanID: scanID, reason: "scanFailed", state: .needsRebaseline, at: timeSource.now())
+            throw error
         }
     }
+
+    private func scanIsValid(_ epoch: Int) -> Bool { !paused && scanEpoch == epoch }
+    public var isPaused: Bool { paused }
+
+    public func sampleIfDue() async throws {
+        let now = timeSource.now()
+        guard lastSample == nil || now.timeIntervalSince(lastSample!) >= config.sampleInterval else { return }
+        let (sample, method) = try await sampleVolume()
+        _ = try await recordVolumeDecision(sample, method: method, now: now)
+    }
+
+    public func setPaused(_ value: Bool) async throws {
+        guard paused != value else { return }
+        paused = value
+        scanEpoch += 1
+        let now = timeSource.now()
+        if value {
+            let gap = CoverageGap(start: now, cause: .manualPause, affectedRoots: config.roots.map(\.path), severity: .medium)
+            pauseGap = gap
+            try await store.insert(gap)
+        } else {
+            if let gap = pauseGap {
+                try await store.insert(CoverageGap(id: gap.id, start: gap.start, end: now, cause: gap.cause, affectedRoots: gap.affectedRoots, severity: gap.severity))
+            }
+            pauseGap = nil
+            for root in config.roots {
+                try await store.resetBaseline(rootID: MonitoredRoot.stableID(canonicalPath: FilePaths.canonical(root.path)))
+            }
+            lastCalibrationByRoot.removeAll()
+        }
+        try await store.setState("paused", value ? "true" : "false", at: now)
+    }
+
+    public func requestCalibration() { lastCalibrationByRoot.removeAll() }
 
     private func persistHints(_ hints: [ChangeHint], at now: Date) async throws {
         guard !hints.isEmpty else { return }
@@ -450,23 +510,21 @@ public actor MonitorCoordinator {
     }
 
     private func evaluate(deltas: [DirectoryDelta], now: Date) async throws -> [AlertDecision] {
-        let rules = try await store.userRules()
         // Attribute each concrete scope independently (ancestors are not
         // filtered out before attribution); display dedups later.
         let bounded = deltas.sorted { abs($0.deltaAllocatedBytes) > abs($1.deltaAllocatedBytes) }
         var decisions: [AlertDecision] = []
         for delta in bounded.prefix(200) {
-            let evidence = try await attribution(for: delta, now: now)
-            let key = "dir:\(delta.pathID)"
-            let lastAlert = try await store.lastAlertDate(cooldownKey: key)
-            let decision = AlertPolicy.evaluate(
-                observation: .directory(delta), evidence: evidence, userRules: rules,
-                config: config.policy, now: now, lastAlertAt: lastAlert)
+            // A directory calibration is a wide observation window, never a
+            // standalone source of Agent notifications. File events own attribution.
+            let decision = AlertDecision(
+                ruleVersion: AlertPolicyVersion.current, subjectID: delta.id,
+                action: .silent, reason: .unknownSource, evidenceClass: .unknown,
+                cooldownKey: "dir:\(delta.pathID)", evaluatedAt: now)
             try await store.insert(decision)
-            await enqueueIfNeeded(decision, now: now)
             decisions.append(decision)
-            for item in evidence { try await store.insert(item) }
         }
+
         return decisions
     }
 
@@ -536,7 +594,7 @@ public actor MonitorCoordinator {
             let key = "event:\(item.event.scopePath)"
             let lastAlert = try await store.lastAlertDate(cooldownKey: key)
             let decision = AlertPolicy.evaluate(
-                observation: .event(item.event), evidence: [], userRules: rules,
+                observation: .event(try await store.event(id: item.event.id) ?? item.event), evidence: [], userRules: rules,
                 config: config.policy, now: now, lastAlertAt: lastAlert)
             try await store.insert(decision)
             await enqueueIfNeeded(decision, now: now)
