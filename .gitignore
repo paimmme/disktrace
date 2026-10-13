@@ -4,3 +4,5 @@
 *.sqlite-wal
 *.sqlite-shm
 Package.resolved
+*.diff
+artifacts/

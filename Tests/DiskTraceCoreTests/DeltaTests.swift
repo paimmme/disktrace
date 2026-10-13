@@ -28,6 +28,19 @@ actor ScriptedScanner: ScannerBackend {
         guard !queue.isEmpty else { throw ScannerUnavailableError(reason: "exhausted") }
         return queue.removeFirst()
     }
+
+    func scanEntries(
+        root: URL, excluding: [String], limits: ScanLimits,
+        onEntry: @escaping @Sendable (ScanEntry) async throws -> Void
+    ) async throws -> ScanCompletion {
+        let result = try await scan(root: root, excluding: excluding)
+        for summary in result.directories { try await onEntry(.directory(summary)) }
+        return ScanCompletion(
+            root: result.root, startedAt: result.scannedAt, endedAt: result.scannedAt,
+            complete: !result.incomplete, entryCount: result.totalFileCount,
+            directoryCount: result.directories.count, checkpointID: result.checkpointID,
+            termination: result.incomplete ? .storageError : .completed)
+    }
 }
 
 @Suite("Directory delta correctness")
@@ -166,4 +179,16 @@ final class RepeatingScanner: ScannerBackend, @unchecked Sendable {
     private let make: @Sendable (URL) -> ScanResult
     init(_ make: @escaping @Sendable (URL) -> ScanResult) { self.make = make }
     func scan(root: URL, excluding: [String]) async throws -> ScanResult { make(root) }
+    func scanEntries(
+        root: URL, excluding: [String], limits: ScanLimits,
+        onEntry: @escaping @Sendable (ScanEntry) async throws -> Void
+    ) async throws -> ScanCompletion {
+        let result = make(root)
+        for summary in result.directories { try await onEntry(.directory(summary)) }
+        return ScanCompletion(
+            root: result.root, startedAt: result.scannedAt, endedAt: result.scannedAt,
+            complete: true, entryCount: result.totalFileCount,
+            directoryCount: result.directories.count, checkpointID: result.checkpointID,
+            termination: .completed)
+    }
 }

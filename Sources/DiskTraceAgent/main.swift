@@ -1,94 +1,28 @@
 import DiskTraceCore
 import Foundation
-
-#if canImport(Darwin)
 import Darwin
-#endif
-
-/// Process-wide stop flag set from a POSIX signal handler.
-final class StopFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stopped = false
-    var isSet: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return stopped
-    }
-    func set() {
-        lock.lock()
-        stopped = true
-        lock.unlock()
-    }
-}
-
-let stopFlag = StopFlag()
 
 @main
 struct DiskTraceAgentMain {
     static func main() async {
         let options = AgentOptions.parse(CommandLine.arguments)
-        let fileManager = FileManager.default
-
-        let databaseURL = options.databaseURL
-            ?? fileManager.homeDirectoryForCurrentUser
-                .appending(path: "Library/Application Support/DiskTrace", directoryHint: .isDirectory)
-                .appending(path: "disktrace.sqlite")
-        try? fileManager.createDirectory(
-            at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-        let roots = options.roots.isEmpty
-            ? [fileManager.homeDirectoryForCurrentUser]
-            : options.roots
-
-        do {
-            let store = try DiskTraceStore(path: databaseURL.path)
-            let config = MonitorConfig(
-                roots: roots,
-                exclusions: options.exclusions,
-                sampleInterval: options.interval)
-            let activitySync = AgentActivitySync(
-                configuration: CodexIntegrationConfiguration(
-                    codexHome: options.codexHome,
-                    hashWorkingDirectory: options.hashCodexPaths))
-            let coordinator = MonitorCoordinator(
-                config: config,
-                store: store,
-                scanner: FixtureScanner(),
-                scannerName: "fixture",
-                activitySync: activitySync)
-
-            signal(SIGTERM) { _ in stopFlag.set() }
-            signal(SIGINT) { _ in stopFlag.set() }
-
-            fputs("disktrace-agent starting; db=\(databaseURL.path)\n", stderr)
-            for root in roots { fputs("  monitoring root: \(root.path)\n", stderr) }
-            fputs("  codex sessions: \(options.resolvedCodexHome.path)\n", stderr)
-
-            try await coordinator.start()
-
-            while true {
-                let report = try await coordinator.runOnce()
-                let health = await coordinator.health()
-                fputs(
-                    "cycle: changes=\(report.changeCount) deltas=\(report.deltas.count) "
-                        + "decisions=\(report.decisions.count) gaps=\(report.gaps.count) "
-                        + "sample=\(report.sample.map { "\($0.freeBytes)B free" } ?? "none") "
-                        + "running=\(health.running)\n",
-                    stderr)
-                if options.once || stopFlag.isSet { break }
-                try? await Task.sleep(for: .seconds(options.interval))
-            }
-
-            await coordinator.stop()
-            fputs("disktrace-agent stopped\n", stderr)
-        } catch {
-            fputs("disktrace-agent fatal: \(error)\n", stderr)
+        guard options.interval.isFinite, options.interval > 0,
+              options.calibration.isFinite, options.calibration > 0 else {
+            fputs("Invalid sampling/calibration interval\n", stderr); exit(2)
         }
-    }
-
-    private static func refreshCodexActivities(store: DiskTraceStore) async throws {
-        // Superseded by AgentActivitySync, which runs every cycle inside the
-        // coordinator. Kept as a no-op reference point.
+        let support = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Application Support/DiskTrace")
+        let database = options.databaseURL ?? support.appending(path: "disktrace.sqlite")
+        let roots = options.roots.isEmpty ? [FileManager.default.homeDirectoryForCurrentUser] : options.roots
+        let task = Task {
+            try await AgentRuntime.run(databaseURL: database,
+                config: MonitorConfig(roots: roots, exclusions: options.exclusions, sampleInterval: options.interval, calibrationInterval: options.calibration),
+                codex: CodexIntegrationConfiguration(codexHome: options.codexHome, hashWorkingDirectory: options.hashCodexPaths), once: options.once)
+        }
+        let signals = AgentSignalHandler { task.cancel() }
+        do { try await task.value }
+        catch is CancellationError { }
+        catch { fputs("disktrace-agent fatal: \(error)\n", stderr); exit(1) }
+        withExtendedLifetime(signals) {}
     }
 }
 
@@ -97,6 +31,7 @@ struct AgentOptions {
     var roots: [URL] = []
     var exclusions: [String] = []
     var interval: TimeInterval = 60
+    var calibration: TimeInterval = 900
     var once = false
     var codexHome: URL?
     var hashCodexPaths = false
@@ -129,6 +64,8 @@ struct AgentOptions {
                 if let value = next() { options.codexHome = URL(filePath: value) }
             case "--hash-codex-paths":
                 options.hashCodexPaths = true
+            case "--calibration":
+                if let value = next(), let seconds = TimeInterval(value) { options.calibration = seconds }
             case "--once":
                 options.once = true
             default:

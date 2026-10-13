@@ -37,8 +37,6 @@ Legend: **PASS** (executed here), **NOT RUN** (not executed), **BLOCKED**
 
 48 tests in 12 suites, all passing. Raw evidence: `artifacts/evidence/tests-*.txt`.
 
-## Continuous-run behaviours (the review's focus)
-
 | Guarantee | Covered by |
 |---|---|
 | No duplicate collection on repeated sync | `CodexSyncTests.idempotentResync` |
@@ -46,3 +44,18 @@ Legend: **PASS** (executed here), **NOT RUN** (not executed), **BLOCKED**
 | Permission recovery is not counted as growth | `DeltaTests.incompleteYieldsNothing`, `MonitorCompletenessTests.incompleteThenRecovery` |
 | Truncation/rotation recorded, not silently absorbed | `CodexSyncTests.truncationResets` |
 | Database occupancy is explainable and bounded | `RetentionTests.quotaPrunes` (effective pages + file size) |
+
+## 原始需求闭环（本轮新增，99 tests / 20 suites）
+
+新增测试套件覆盖规格的 C/D/E/N 场景：
+
+- `CodexEnvelopeTests`（C01–C18）：真实 `event_msg` 信封、256B/轮读到最后完整行、全局预算受限、半行跨重启、超长行跳过、discard 跨重启、重复 start/end 幂等、重启保留原始开始时间、缺失开始=unknownStart、并发任务、诱饵正文不解码、malformed 失败闭合、desktop originator 不误标、401 日志无饥饿。
+- `FileChangeTests`（D01–D17）：基线不产生变化、新增/增长/缩小、删除整棵子树、同路径替换、同 identity 重命名=一条 moved、硬链接共享 identity、瞬时文件无事实、hint 幂等、symlink 不跟随。
+- `EventAssemblyTests`（E01–E12）：项目候选不被根吞并、Downloads 保持 unknown、同目录两任务 ambiguous、仅时间重合=timeOnly、cwd 外缓存类型可见来源未知、node_modules 名称线索仍 unknown、用户确认/撤销、presence present/replaced/missing。
+- `NotificationTests`（N09/N11/N12 等）：outbox 幂等、冷却抑制、quiet hours 延期、到期丢弃、critical 突破免打扰、`acceptedByOS` 语义、文案合同不含“下载/垃圾/可放心删除”。
+
+- `MetadataProbe` / `StreamingScanner`：`FixtureScannerTests` + `FileChangeTests.D08`（symlink 不跟随）。
+
+**99 tests in 20 suites, all passing.** 隔离端到端：`scripts/acceptance-original-need.sh`（全部断言 PASS）。原始证据：`artifacts/evidence/original-need/`。
+
+真实机器 / 真实客户端 / 通知 / 登录恢复 / 24 小时资源：见 `docs/ORIGINAL_NEED_ACCEPTANCE.md`（NOT RUN/BLOCKED）。

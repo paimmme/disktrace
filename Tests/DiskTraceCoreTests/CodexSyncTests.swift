@@ -161,17 +161,23 @@ struct CodexSyncTests {
         let line = Data(
             #"{"type":"session_meta","timestamp":"2026-10-12T10:00:00Z","payload":{"session_id":"n\u00e9\u0041","cwd":"/Users/d\u00e9v","nested":{"cwd":"/SHOULD-NOT-READ"}}}"#
                 .utf8)
-        let event = try #require(CodexEventParser.parse(line, schema: .default))
+        let event = try #require(try? CodexEventParser.parse(line, schema: .default).get())
         #expect(event.sessionID == "néA")
         #expect(event.workingDirectory == "/Users/dév")
-        #expect(event.type == "session_meta")
+        #expect(event.topType == "session_meta")
 
-        // A skipped (unknown-value) container must not leak a nested key.
+        // A skipped (unknown-value) container must not leak a nested key, and an
+        // unknown top-level event must not even decode its payload.
         let noisy = Data(
             #"{"type":"message","payload":{"cwd":"/leak","deep":{"session_id":"LEAK"}}}"#.utf8)
-        let noisyEvent = try #require(CodexEventParser.parse(noisy, schema: .default))
+        let counter = CodexDecodeCounter()
+        let noisyEvent = try #require(
+            try? CodexEventParser.parse(noisy, schema: .default, counter: counter).get())
         #expect(noisyEvent.workingDirectory == nil)
         #expect(noisyEvent.sessionID == nil)
+        // Only the two top-level keys and the "type" value are decoded; the
+        // payload body is skipped and does not scale the count.
+        #expect(counter.decodedStrings == 3)
     }
 
     @Test("hashed working directory option")

@@ -28,9 +28,9 @@ enum SQLiteValue {
 final class SQLiteDatabase {
     fileprivate let handle: OpaquePointer
 
-    init(path: String) throws {
+    init(path: String, readOnly: Bool = false) throws {
         var h: OpaquePointer?
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        let flags = (readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) | SQLITE_OPEN_FULLMUTEX
         let rc = sqlite3_open_v2(path, &h, flags, nil)
         guard rc == SQLITE_OK, let opened = h else {
             let message = h.map { String(cString: sqlite3_errmsg($0)) } ?? "unable to open \(path)"
@@ -38,6 +38,11 @@ final class SQLiteDatabase {
             throw SQLiteError(message: message, code: rc)
         }
         handle = opened
+        if readOnly {
+            try execute("PRAGMA query_only=ON;")
+            try execute("PRAGMA busy_timeout=5000;")
+            return
+        }
         // auto_vacuum only takes effect while the database still has no tables,
         // so set it before migrations create any.
         try execute("PRAGMA auto_vacuum=INCREMENTAL;")

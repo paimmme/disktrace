@@ -83,3 +83,4 @@ up — DiskTrace reports the difference rather than forcing a total.
 - **ADR-07** Depth views load on demand; aggregates live in SQLite; the Agent never holds a full-disk tree.
 - **ADR-08** Prefer SMAppService, SQLite, Swift Charts and a mature updater over bespoke system code. *(SMAppService registration and the updater are not yet built.)*
 - **ADR-09** Engineering Complete ≠ Release Ready; unverified process attribution and hardware/permission capabilities are never presented as passing.
+- **ADR-10** A single, bounded **current file-metadata index** per monitored root (one active generation plus at most one preparing generation), scoped to the user's monitored roots — no whole-disk tree, no per-cycle full-tree history, never kept resident in memory. Concrete `file_changes` are derived by diffing generations; the index is trimmed by coverage/recency budget and an evicted path later seen again is `beforeUnknown`, never treated as newly created.
