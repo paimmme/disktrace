@@ -177,22 +177,66 @@ extension DiskTraceStore {
         let linkCount: Int
     }
 
-    private func loadInventory(rootID: UUID, scanID: UUID) throws -> [String: InventoryRow] {
+    /// One row of the before/after inventory diff. `oldId` is nil for a pure
+    /// addition; `newId` is nil for a pure removal.
+    struct DiffRow {
+        let path: String
+        let oldId: String?
+        let newId: String?
+        let oldAllocated: Int64?
+        let newAllocated: Int64?
+        let oldLogical: Int64?
+        let newLogical: Int64?
+        let oldLink: Int?
+        let newLink: Int?
+    }
+
+    /// Streams the diff between two inventory generations through the
+    /// `(root_id, scan_id, path)` primary-key index. It never builds two
+    /// in-memory dictionaries of the whole tree: SQLite walks `new` and probes
+    /// `old` (and vice versa) one row at a time, so app-layer memory is bounded
+    /// by the change set, not the file count. `UNION ALL` + `LEFT JOIN` is used
+    /// (not `FULL OUTER JOIN`) for compatibility with the system SQLite.
+    func forEachDiffRow(
+        rootID: UUID, previous: UUID, current: UUID, _ body: (DiffRow) throws -> Void
+    ) throws {
         let statement = try database.prepare(
             """
-            SELECT path, file_identity, allocated_bytes, logical_bytes, link_count
-            FROM file_inventory WHERE root_id=? AND scan_id=?;
+            SELECT n.path, o.file_identity, n.file_identity,
+                   o.allocated_bytes, n.allocated_bytes,
+                   o.logical_bytes, n.logical_bytes,
+                   o.link_count, n.link_count
+            FROM file_inventory AS n
+            LEFT JOIN file_inventory AS o
+              ON o.root_id=n.root_id AND o.scan_id=? AND o.path=n.path
+            WHERE n.root_id=? AND n.scan_id=?
+            UNION ALL
+            SELECT o.path, o.file_identity, NULL,
+                   o.allocated_bytes, NULL,
+                   o.logical_bytes, NULL,
+                   o.link_count, NULL
+            FROM file_inventory AS o
+            LEFT JOIN file_inventory AS n
+              ON n.root_id=o.root_id AND n.scan_id=? AND n.path=o.path
+            WHERE o.root_id=? AND o.scan_id=? AND n.path IS NULL;
             """)
-        try statement.bind([.text(rootID.uuidString), .text(scanID.uuidString)])
-        var result: [String: InventoryRow] = [:]
+        try statement.bind([
+            .text(previous.uuidString), .text(rootID.uuidString), .text(current.uuidString),
+            .text(current.uuidString), .text(rootID.uuidString), .text(previous.uuidString),
+        ])
         while try statement.step() {
-            result[statement.text(0)] = InventoryRow(
-                identity: statement.text(1),
-                allocated: statement.isNull(2) ? nil : statement.int64(2),
-                logical: statement.isNull(3) ? nil : statement.int64(3),
-                linkCount: statement.int(4))
+            try body(
+                DiffRow(
+                    path: statement.text(0),
+                    oldId: statement.optionalText(1),
+                    newId: statement.optionalText(2),
+                    oldAllocated: statement.isNull(3) ? nil : statement.int64(3),
+                    newAllocated: statement.isNull(4) ? nil : statement.int64(4),
+                    oldLogical: statement.isNull(5) ? nil : statement.int64(5),
+                    newLogical: statement.isNull(6) ? nil : statement.int64(6),
+                    oldLink: statement.isNull(7) ? nil : statement.int(7),
+                    newLink: statement.isNull(8) ? nil : statement.int(8)))
         }
-        return result
     }
 
     private func loadDirectorySummaries(scanID: UUID) throws -> [String: Int64] {
@@ -269,16 +313,10 @@ extension DiskTraceStore {
             return PublishResult(state: .baseline, fileChanges: [], directoryDeltas: [])
         }
 
-        let before = try loadInventory(rootID: rootID, scanID: previous)
-        let after = try loadInventory(rootID: rootID, scanID: scanID)
         let windowStart = try scanEndedAt(scanID: previous) ?? date
-        var changes = Self.diff(
-            before: before, after: after, rootID: rootID, scanID: scanID,
-            windowStart: windowStart, windowEnd: date, observedAt: date)
-        changes = Self.mergeMoves(changes)
 
-        let beforeSummaries = try loadDirectorySummaries(scanID: previous)
-        let afterSummaries = try loadDirectorySummaries(scanID: scanID)
+        let beforeSummaries = try directorySummaries(scanID: previous)
+        let afterSummaries = try directorySummaries(scanID: scanID)
         var deltas: [DirectoryDelta] = []
         for path in Set(beforeSummaries.keys).union(afterSummaries.keys) {
             let old = beforeSummaries[path] ?? 0
@@ -291,8 +329,76 @@ extension DiskTraceStore {
                     afterAllocatedBytes: new, checkpointID: 0, calibration: .calibrated))
         }
 
+        var emitted: [FileChange] = []
         try database.transaction {
-            for change in changes { try insertFileChange(change) }
+            // Stream the diff. Same-path content changes are written immediately
+            // in batches; pure additions/removals are held only by identity
+            // (bounded by the change set) so a same-identity rename can be
+            // recognised as one `moved` record.
+            var batch: [FileChange] = []
+            var addedByIdentity: [String: [FileChange]] = [:]
+            var removedByIdentity: [String: [FileChange]] = [:]
+            var addedLinks: [String: Int] = [:]
+            var removedLinks: [String: Int] = [:]
+
+            try forEachDiffRow(rootID: rootID, previous: previous, current: scanID) { row in
+                if let newId = row.newId, row.oldId == nil {
+                    let change = Self.change(
+                        path: row.path, pathAfter: row.path, identityBefore: nil, identityAfter: newId,
+                        kind: .added, before: nil, after: row.newAllocated, beforeLogical: nil,
+                        afterLogical: row.newLogical, delta: row.newAllocated, rootID: rootID,
+                        scanID: scanID, windowStart: windowStart, windowEnd: date, observedAt: date)
+                    addedByIdentity[newId, default: []].append(change)
+                    addedLinks[newId] = row.newLink ?? 1
+                } else if let oldId = row.oldId, row.newId == nil {
+                    let change = Self.change(
+                        path: row.path, pathAfter: row.path, identityBefore: oldId, identityAfter: nil,
+                        kind: .removed, before: row.oldAllocated, after: nil,
+                        beforeLogical: row.oldLogical, afterLogical: nil,
+                        delta: row.oldAllocated.map { -$0 }, rootID: rootID, scanID: scanID,
+                        windowStart: windowStart, windowEnd: date, observedAt: date)
+                    removedByIdentity[oldId, default: []].append(change)
+                    removedLinks[oldId] = row.oldLink ?? 1
+                } else if row.oldId != nil, row.newId != nil {
+                    guard let change = Self.changedRow(
+                        row: row, rootID: rootID, scanID: scanID, windowStart: windowStart,
+                        windowEnd: date, observedAt: date)
+                    else { return }
+                    batch.append(change)
+                    if batch.count >= 500 {
+                        for item in batch { try insertFileChange(item) }
+                        emitted.append(contentsOf: batch)
+                        batch.removeAll(keepingCapacity: true)
+                    }
+                }
+            }
+            if !batch.isEmpty {
+                for item in batch { try insertFileChange(item) }
+                emitted.append(contentsOf: batch)
+            }
+
+            // Same identity, one occurrence each side, no hardlinks → moved.
+            var movedIdentities = Set<String>()
+            var moves: [FileChange] = []
+            for (identity, removed) in removedByIdentity where removed.count == 1 {
+                guard let added = addedByIdentity[identity], added.count == 1 else { continue }
+                guard (removedLinks[identity] ?? 1) <= 1, (addedLinks[identity] ?? 1) <= 1 else {
+                    continue
+                }
+                moves.append(Self.moved(removed: removed[0], added: added[0]))
+                movedIdentities.insert(identity)
+            }
+            var tail: [FileChange] = []
+            for (identity, list) in addedByIdentity where !movedIdentities.contains(identity) {
+                tail.append(contentsOf: list)
+            }
+            for (identity, list) in removedByIdentity where !movedIdentities.contains(identity) {
+                tail.append(contentsOf: list)
+            }
+            tail.append(contentsOf: moves)
+            for change in tail { try insertFileChange(change) }
+            emitted.append(contentsOf: tail)
+
             for delta in deltas { try insert(delta) }
             try rawExecute(
                 "UPDATE root_scans SET state='completed', ended_at=?, entry_count=? WHERE id=?;",
@@ -313,110 +419,76 @@ extension DiskTraceStore {
                 rootID: rootID, state: .ready, activeScanID: scanID, lastSuccessAt: date,
                 nextRetryAt: nil, coverage: "complete")
         }
-        return PublishResult(state: .completed, fileChanges: changes, directoryDeltas: deltas)
+        return PublishResult(state: .completed, fileChanges: emitted, directoryDeltas: deltas)
     }
 
-    // MARK: - Diff rules (§9.1)
+    // MARK: - Diff row → FileChange
 
-    static func diff(
-        before: [String: InventoryRow], after: [String: InventoryRow], rootID: UUID,
-        scanID: UUID, windowStart: Date, windowEnd: Date, observedAt: Date
-    ) -> [FileChange] {
-        var result: [FileChange] = []
-        for path in Set(before.keys).union(after.keys) {
-            let b = before[path]
-            let a = after[path]
-            let id: UUID
-            let kind: FileChangeKind
-            let beforeAllocated = b?.allocated
-            let afterAllocated = a?.allocated
-            let beforeLogical = b?.logical
-            let afterLogical = a?.logical
-            var delta: Int64?
-
-            if let a, b == nil {
-                kind = .added
-                delta = a.allocated
-            } else if let b, a == nil {
-                kind = .removed
-                delta = b.allocated.map { -$0 }
-            } else if let b, let a {
-                if b.identity == a.identity {
-                    let oldBytes = b.allocated ?? 0
-                    let newBytes = a.allocated ?? 0
-                    if newBytes > oldBytes {
-                        kind = .grown
-                    } else if newBytes < oldBytes {
-                        kind = .shrunk
-                    } else if a.logical != b.logical {
-                        kind = .metadataOnly
-                    } else {
-                        continue
-                    }
-                    if b.allocated != nil, a.allocated != nil {
-                        delta = newBytes - oldBytes
-                    }
-                } else {
-                    kind = .replaced
-                    if b.allocated != nil, a.allocated != nil {
-                        delta = (a.allocated ?? 0) - (b.allocated ?? 0)
-                    }
-                }
-            } else {
-                continue
-            }
-
-            id = FileChange.stableID(
+    private static func change(
+        path: String, pathAfter: String, identityBefore: String?, identityAfter: String?,
+        kind: FileChangeKind, before: Int64?, after: Int64?, beforeLogical: Int64?,
+        afterLogical: Int64?, delta: Int64?, rootID: UUID, scanID: UUID, windowStart: Date,
+        windowEnd: Date, observedAt: Date
+    ) -> FileChange {
+        FileChange(
+            id: FileChange.stableID(
                 evidenceVersion: EvidenceVersion.current, rootID: rootID,
-                identityBefore: b?.identity, identityAfter: a?.identity,
-                pathBefore: path, pathAfter: path, locator: scanID.uuidString)
-            result.append(
-                FileChange(
-                    id: id, rootID: rootID, scanID: scanID, pathBefore: path, pathAfter: path,
-                    identityBefore: b?.identity, identityAfter: a?.identity, kind: kind,
-                    windowStart: windowStart, windowEnd: windowEnd, observedAt: observedAt,
-                    beforeLogical: beforeLogical, afterLogical: afterLogical,
-                    beforeAllocated: beforeAllocated, afterAllocated: afterAllocated,
-                    deltaAllocated: delta,
-                    measurement: (beforeAllocated == nil && kind != .added) ? .beforeUnknown : .measured,
-                    timing: .scanWindow, evidenceVersion: EvidenceVersion.current))
-        }
-        return result
+                identityBefore: identityBefore, identityAfter: identityAfter, pathBefore: path,
+                pathAfter: pathAfter, locator: scanID.uuidString),
+            rootID: rootID, scanID: scanID, pathBefore: path, pathAfter: pathAfter,
+            identityBefore: identityBefore, identityAfter: identityAfter, kind: kind,
+            windowStart: windowStart, windowEnd: windowEnd, observedAt: observedAt,
+            beforeLogical: beforeLogical, afterLogical: afterLogical, beforeAllocated: before,
+            afterAllocated: after, deltaAllocated: delta,
+            measurement: (kind != .added && before == nil) ? .beforeUnknown : .measured,
+            timing: .scanWindow, evidenceVersion: EvidenceVersion.current)
     }
 
-    /// Recognises a same-identity, single-link rename as one `moved` change
-    /// instead of an unrelated add + remove.
-    static func mergeMoves(_ changes: [FileChange]) -> [FileChange] {
-        var added: [String: FileChange] = [:]
-        for change in changes where change.kind == .added {
-            if let identity = change.identityAfter { added[identity] = change }
-        }
-        var consumed = Set<UUID>()
-        var moves: [FileChange] = []
-        for change in changes where change.kind == .removed {
-            guard let identity = change.identityBefore, let counterpart = added[identity] else {
-                continue
+    private static func changedRow(
+        row: DiffRow, rootID: UUID, scanID: UUID, windowStart: Date, windowEnd: Date,
+        observedAt: Date
+    ) -> FileChange? {
+        guard let oldId = row.oldId, let newId = row.newId else { return nil }
+        let oldBytes = row.oldAllocated
+        let newBytes = row.newAllocated
+        let kind: FileChangeKind
+        var delta: Int64?
+        if oldId == newId {
+            if let o = oldBytes, let n = newBytes {
+                if n > o { kind = .grown } else if n < o { kind = .shrunk } else if row.newLogical != row.oldLogical {
+                    kind = .metadataOnly
+                } else { return nil }
+                delta = n - o
+            } else {
+                if row.newLogical == row.oldLogical { return nil }
+                kind = .metadataOnly
             }
-            consumed.insert(change.id)
-            consumed.insert(counterpart.id)
-            moves.append(
-                FileChange(
-                    id: FileChange.stableID(
-                        evidenceVersion: change.evidenceVersion, rootID: change.rootID,
-                        identityBefore: change.identityBefore, identityAfter: counterpart.identityAfter,
-                        pathBefore: change.pathBefore, pathAfter: counterpart.pathAfter,
-                        locator: change.scanID?.uuidString ?? "move"),
-                    rootID: change.rootID, scanID: change.scanID,
-                    pathBefore: change.pathBefore, pathAfter: counterpart.pathAfter,
-                    identityBefore: change.identityBefore, identityAfter: counterpart.identityAfter,
-                    kind: .moved, windowStart: change.windowStart, windowEnd: change.windowEnd,
-                    observedAt: change.observedAt, beforeLogical: change.beforeLogical,
-                    afterLogical: counterpart.afterLogical, beforeAllocated: change.beforeAllocated,
-                    afterAllocated: counterpart.afterAllocated, deltaAllocated: 0,
-                    measurement: .measured, timing: .scanWindow,
-                    evidenceVersion: change.evidenceVersion))
+        } else {
+            kind = .replaced
+            if let o = oldBytes, let n = newBytes { delta = n - o }
         }
-        return changes.filter { !consumed.contains($0.id) } + moves
+        return change(
+            path: row.path, pathAfter: row.path, identityBefore: oldId, identityAfter: newId,
+            kind: kind, before: oldBytes, after: newBytes, beforeLogical: row.oldLogical,
+            afterLogical: row.newLogical, delta: delta, rootID: rootID, scanID: scanID,
+            windowStart: windowStart, windowEnd: windowEnd, observedAt: observedAt)
+    }
+
+    private static func moved(removed: FileChange, added: FileChange) -> FileChange {
+        FileChange(
+            id: FileChange.stableID(
+                evidenceVersion: removed.evidenceVersion, rootID: removed.rootID,
+                identityBefore: removed.identityBefore, identityAfter: added.identityAfter,
+                pathBefore: removed.pathBefore, pathAfter: added.pathAfter,
+                locator: "move:\(removed.scanID?.uuidString ?? "")"),
+            rootID: removed.rootID, scanID: removed.scanID, pathBefore: removed.pathBefore,
+            pathAfter: added.pathAfter, identityBefore: removed.identityBefore,
+            identityAfter: added.identityAfter, kind: .moved, windowStart: removed.windowStart,
+            windowEnd: removed.windowEnd, observedAt: removed.observedAt,
+            beforeLogical: removed.beforeLogical, afterLogical: added.afterLogical,
+            beforeAllocated: removed.beforeAllocated, afterAllocated: added.afterAllocated,
+            deltaAllocated: 0, measurement: .measured, timing: .scanWindow,
+            evidenceVersion: removed.evidenceVersion)
     }
 
     // MARK: - File change queries
