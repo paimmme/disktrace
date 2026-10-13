@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+Package.resolved

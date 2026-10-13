@@ -1,0 +1,54 @@
+import Foundation
+
+public enum CoverageGapCause: String, Codable, Sendable {
+    case sleepWake
+    case agentRestart
+    case fseventsOverflow
+    case eventIDUnavailable
+    case permissionDenied
+    case manualPause
+    case scannerUnavailable
+}
+
+public enum CoverageSeverity: String, Codable, Sendable, Comparable {
+    case low
+    case medium
+    case high
+
+    private var order: Int {
+        switch self {
+        case .low: return 0
+        case .medium: return 1
+        case .high: return 2
+        }
+    }
+
+    public static func < (lhs: Self, rhs: Self) -> Bool { lhs.order < rhs.order }
+}
+
+/// An interval during which monitoring could not fully observe changes.
+/// Gaps are surfaced, never silently papered over with a reconstructed history.
+public struct CoverageGap: Codable, Sendable, Hashable, Identifiable {
+    public let id: UUID
+    public let start: Date
+    public let end: Date?
+    public let cause: CoverageGapCause
+    public let affectedRoots: [String]
+    public let severity: CoverageSeverity
+
+    public init(
+        id: UUID = UUID(),
+        start: Date,
+        end: Date? = nil,
+        cause: CoverageGapCause,
+        affectedRoots: [String],
+        severity: CoverageSeverity
+    ) {
+        self.id = id
+        self.start = start
+        self.end = end
+        self.cause = cause
+        self.affectedRoots = affectedRoots
+        self.severity = severity
+    }
+}
