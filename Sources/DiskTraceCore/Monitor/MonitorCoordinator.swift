@@ -54,6 +54,7 @@ public actor MonitorCoordinator {
     public struct CycleReport: Sendable {
         public var sample: VolumeSample?
         public var changeCount: Int = 0
+        public var syncedActivities: Int = 0
         public var deltas: [DirectoryDelta] = []
         public var decisions: [AlertDecision] = []
         public var gaps: [CoverageGap] = []
@@ -65,10 +66,16 @@ public actor MonitorCoordinator {
     private let sampler: VolumeSampler
     private let timeSource: TimeSource
     private let scannerName: String
+    private let activitySync: AgentActivitySync?
 
     private var changeMonitor: ChangeMonitor?
-    private var baseline: [String: ScanResult] = [:]
-    private var lastCalibration: Date?
+    /// Per-root scan state. Baselines and calibration times are tracked
+    /// independently so one root's success or failure never affects another.
+    private struct RootState {
+        var baseline: ScanResult?
+        var lastCalibration: Date?
+    }
+    private var rootStates: [String: RootState] = [:]
     private var lastSample: Date?
     private var lastRetention: Date?
     private var running = false
@@ -80,7 +87,8 @@ public actor MonitorCoordinator {
         scanner: ScannerBackend = FixtureScanner(),
         sampler: VolumeSampler = VolumeSampler(),
         timeSource: TimeSource = SystemTimeSource(),
-        scannerName: String = "fixture"
+        scannerName: String = "fixture",
+        activitySync: AgentActivitySync? = nil
     ) {
         self.config = config
         self.store = store
@@ -88,6 +96,7 @@ public actor MonitorCoordinator {
         self.sampler = sampler
         self.timeSource = timeSource
         self.scannerName = scannerName
+        self.activitySync = activitySync
     }
 
     public var isRunning: Bool { running }
@@ -115,6 +124,11 @@ public actor MonitorCoordinator {
         }
         for root in config.roots {
             await calibrateBaseline(root: root)
+        }
+        // Incremental Codex sync runs before attribution so the current cycle
+        // has the freshest session metadata available.
+        if let activitySync {
+            _ = await activitySync.sync(store: store, now: timeSource.now())
         }
         try await store.setState("running", "true", at: timeSource.now())
     }
@@ -150,35 +164,40 @@ public actor MonitorCoordinator {
                 openGaps.append(gap)
                 try await store.insert(gap)
                 report.gaps.append(gap)
-                lastCalibration = nil  // force recalibration
+                // Force recalibration of every root on the next pass.
+                for key in rootStates.keys { rootStates[key]?.lastCalibration = nil }
             }
         }
 
-        // 3. Directory recalibration (periodic, or forced by overflow).
-        let calibrationDue =
-            lastCalibration == nil
-            || now.timeIntervalSince(lastCalibration!) >= config.calibrationInterval
-        if calibrationDue {
-            for root in config.roots {
-                do {
-                    let deltas = try await calibrate(root: root, now: now)
-                    report.deltas.append(contentsOf: deltas)
-                    let decisions = try await evaluate(deltas: deltas, now: now)
-                    report.decisions.append(contentsOf: decisions)
-                    lastCalibration = now
-                } catch let error as ScannerUnavailableError {
-                    let gap = CoverageGap(
-                        start: now, cause: .scannerUnavailable,
-                        affectedRoots: [root.path], severity: .medium)
-                    openGaps.append(gap)
-                    try await store.insert(gap)
-                    report.gaps.append(gap)
-                    _ = error
-                }
+        // 3. Incremental session sync — before directory attribution.
+        if let activitySync {
+            let synced = await activitySync.sync(store: store, now: now)
+            report.syncedActivities = synced.activitiesUpserted
+        }
+
+        // 4. Directory recalibration (per root, periodic or forced by overflow).
+        for root in config.roots {
+            let key = FilePaths.canonical(root.path)
+            let last = rootStates[key]?.lastCalibration
+            let due = last == nil || now.timeIntervalSince(last!) >= config.calibrationInterval
+            guard due else { continue }
+            do {
+                let deltas = try await calibrate(root: root, now: now)
+                report.deltas.append(contentsOf: deltas)
+                let decisions = try await evaluate(deltas: deltas, now: now)
+                report.decisions.append(contentsOf: decisions)
+            } catch let error as ScannerUnavailableError {
+                let gap = CoverageGap(
+                    start: now, cause: .scannerUnavailable,
+                    affectedRoots: [root.path], severity: .medium)
+                openGaps.append(gap)
+                try await store.insert(gap)
+                report.gaps.append(gap)
+                _ = error
             }
         }
 
-        // 4. Retention.
+        // 5. Retention.
         if lastRetention == nil
             || now.timeIntervalSince(lastRetention!) >= config.retentionInterval
         {
@@ -209,12 +228,15 @@ public actor MonitorCoordinator {
         return sample
     }
 
-    /// Establishes (or refreshes) the baseline scan for a root without emitting
-    /// deltas — used at startup so a first calibration does not look like growth.
+    /// Establishes the baseline scan for a root without emitting deltas. The
+    /// baseline is only accepted when the scan is complete; an incomplete first
+    /// scan leaves the root un-baselined until it can be read fully.
     private func calibrateBaseline(root: URL) async {
         do {
             let result = try await scanner.scan(root: root, excluding: config.exclusions)
-            baseline[result.root] = result
+            if !result.incomplete {
+                rootStates[result.root] = RootState(baseline: result, lastCalibration: nil)
+            }
         } catch {
             let gap = CoverageGap(
                 start: timeSource.now(), cause: .scannerUnavailable,
@@ -225,37 +247,52 @@ public actor MonitorCoordinator {
     }
 
     private func calibrate(root: URL, now: Date) async throws -> [DirectoryDelta] {
-        let result = try await scanner.scan(root: root, excluding: config.exclusions)
-        defer { baseline[result.root] = result }
-        guard let previous = baseline[result.root] else {
-            // First calibration after start(): no delta yet.
+        let current = try await scanner.scan(root: root, excluding: config.exclusions)
+        let key = current.root
+        var state = rootStates[key] ?? RootState()
+        defer { rootStates[key] = state }
+
+        guard let previous = state.baseline else {
+            // First observation: become a baseline only when it is complete.
+            if !current.incomplete {
+                state.baseline = current
+                state.lastCalibration = now
+            }
             return []
         }
-        let windowStart = previous.scannedAt
-        var deltas = result.deltas(from: previous, windowStart: windowStart)
-        if result.incomplete {
+
+        // Never derive a trusted delta from an incomplete window: a permission
+        // loss must not look like a deletion, nor a recovery like growth.
+        if previous.incomplete || current.incomplete {
             let gap = CoverageGap(
-                start: windowStart, end: result.scannedAt, cause: .permissionDenied,
-                affectedRoots: [result.root], severity: .low)
+                start: previous.scannedAt, end: current.scannedAt, cause: .permissionDenied,
+                affectedRoots: [current.root], severity: .medium)
             openGaps.append(gap)
-            try? await store.insert(gap)
+            try await store.insert(gap)
+            // Re-baseline only once the scan is complete again; until then the
+            // old complete baseline is kept, so recovery diffs against it.
+            if !current.incomplete {
+                state.baseline = current
+                state.lastCalibration = now
+            }
+            return []
         }
-        // Persist the deltas.
-        for delta in deltas {
-            try await store.insert(delta)
-        }
-        // Cap what we return/evaluate to the largest movers to stay bounded.
-        if deltas.count > 200 {
-            deltas.sort { $0.deltaAllocatedBytes > $1.deltaAllocatedBytes }
-            deltas = Array(deltas.prefix(200))
-        }
+
+        let deltas = current.deltas(from: previous, windowStart: previous.scannedAt)
+        state.baseline = current
+        state.lastCalibration = now
+        for delta in deltas { try await store.insert(delta) }
         return deltas
     }
 
     private func evaluate(deltas: [DirectoryDelta], now: Date) async throws -> [AlertDecision] {
         let rules = try await store.userRules()
+        // Evaluate only non-overlapping directories so parent and child subtree
+        // totals are never double-counted. All deltas remain persisted as facts.
+        let candidates = ScanResult.nonOverlapping(deltas)
         var decisions: [AlertDecision] = []
-        for delta in deltas {
+        let bounded = candidates.sorted { abs($0.deltaAllocatedBytes) > abs($1.deltaAllocatedBytes) }
+        for delta in bounded.prefix(200) {
             let evidence = try await attribution(for: delta, now: now)
             let key = "dir:\(delta.pathID)"
             let lastAlert = try await store.lastAlertDate(cooldownKey: key)
@@ -325,13 +362,14 @@ public actor MonitorCoordinator {
     }
 
     public func health() async -> MonitorHealth {
+        let calibrations = rootStates.values.compactMap(\.lastCalibration)
         return MonitorHealth(
             running: running,
             lastSampleAt: lastSample,
-            lastCalibrationAt: lastCalibration,
-            baselineEstablished: !baseline.isEmpty,
+            lastCalibrationAt: calibrations.max(),
+            baselineEstablished: rootStates.values.contains { $0.baseline != nil },
             openGapCount: openGaps.count,
-            databaseBytes: await store.estimatedDatabaseBytes(),
+            databaseBytes: await store.spaceReport().effectiveBytes,
             rootCount: config.roots.count,
             scannerBackend: scannerName)
     }

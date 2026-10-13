@@ -3,7 +3,7 @@ import Foundation
 /// Versioned, transactional schema migrations. The schema is deliberately small
 /// and access-pattern driven rather than fully normalized.
 enum Migrations {
-    static let currentVersion = 1
+    static let currentVersion = 3
 
     static func migrate(_ database: SQLiteDatabase) throws {
         try database.execute(
@@ -19,6 +19,20 @@ enum Migrations {
                 try database.execute(schemaV1)
                 try database.execute("DELETE FROM schema_version;")
                 try database.execute("INSERT INTO schema_version(version) VALUES (1);")
+            }
+        }
+        if version < 2 {
+            try database.transaction {
+                try database.execute(schemaV2)
+                try database.execute("DELETE FROM schema_version;")
+                try database.execute("INSERT INTO schema_version(version) VALUES (2);")
+            }
+        }
+        if version < 3 {
+            try database.transaction {
+                try database.execute(schemaV3)
+                try database.execute("DELETE FROM schema_version;")
+                try database.execute("INSERT INTO schema_version(version) VALUES (3);")
             }
         }
     }
@@ -115,5 +129,28 @@ enum Migrations {
             value TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
+        """
+
+    /// v2 — continuous attribution: task identity on activities and per-file
+    /// session-log sync cursors. Upgrade is a single versioned transaction.
+    private static let schemaV2 = """
+        ALTER TABLE agent_activities ADD COLUMN task_id_hash TEXT;
+        ALTER TABLE agent_activities ADD COLUMN window_is_task_bounded INTEGER NOT NULL DEFAULT 0;
+
+        CREATE TABLE IF NOT EXISTS session_sync (
+            file_path TEXT PRIMARY KEY,
+            file_identity TEXT NOT NULL,
+            session_id_hash TEXT,
+            byte_offset INTEGER NOT NULL,
+            file_size INTEGER NOT NULL,
+            modified_at REAL,
+            last_processed REAL NOT NULL
+        );
+        """
+
+    /// v3 — persist the normalized working directory alongside the cursor so
+    /// session metadata survives a restart (the log prefix is not re-read).
+    private static let schemaV3 = """
+        ALTER TABLE session_sync ADD COLUMN working_directory TEXT;
         """
 }

@@ -36,8 +36,28 @@ Honest, current limits. None of these is hidden behind marketing language.
 ## Known rough edges in this repo
 
 - `DiskTraceApp` compiles but has not been run as a bundle.
-- `estimatedDatabaseBytes()` reports SQLite page size; the retention soft quota
-  does not yet include the WAL/SHM files themselves (the caller is expected to).
 - `RadixScannerBackend` is a compile-time placeholder that always reports
   unavailable; wiring it requires the vendored+patched upstream described in
   `docs/REUSE_AUDIT.md`.
+
+## Session sync & retention (reviewed behaviours)
+
+- **Event type names are unverified.** The recognised Codex event `type` values
+  (session/task start/end) are a configurable default; real client names must be
+  confirmed per client (G4). Until then, real task windows may degrade to an
+  open, lower-confidence session window.
+- **Cross-restart partial line.** The cursor is persisted at a line boundary;
+  a trailing partial record is re-read after a restart, so no *complete* record
+  is lost, but a record mid-write at crash time is only recovered once complete.
+- **Session identity and working directory persist across restarts** (schema v3),
+  but **open-task state is in memory only**: if the agent restarts while a task
+  is open, its start event was already consumed and is not re-read, so the
+  eventual completion still produces an activity but with an approximate window.
+- **auto_vacuum only applies to new databases.** An existing database keeps its
+  `auto_vacuum` setting; space reclamation then relies on WAL checkpoint and row
+  deletion (freelist), not `incremental_vacuum`. A full `VACUUM` is never run
+  automatically — converting an old database is a separate, manual maintenance
+  step so a low-disk machine is not surprised by a large rewrite.
+- **Directory recalibration is periodic full-scan**, not event-driven subtree
+  splicing (see G3).
+- **`claudeCode`** is modelled in the enum but has no adapter.

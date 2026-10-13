@@ -48,28 +48,59 @@ public struct ScanResult: Sendable, Hashable {
         directories.first { $0.path == path }?.allocatedBytes
     }
 
-    /// Compute per-directory deltas between a previous scan and this one.
+    /// Compute per-directory deltas between a previous scan and this one, over
+    /// the **union** of before/after paths so removed directories are recorded
+    /// as negative change instead of silently disappearing.
+    ///
+    /// Returns `[]` (no trusted delta) whenever either scan is incomplete — a
+    /// permission loss must never masquerade as a deletion and a permission
+    /// recovery must never masquerade as growth. The coordinator records a
+    /// `CoverageGap` and re-baselines when the scan becomes complete again.
+    ///
+    /// A rename is expressed as an old-path decrease plus a new-path increase;
+    /// with no file-identity evidence, no move relationship is inferred.
     public func deltas(from previous: ScanResult, windowStart: Date) -> [DirectoryDelta] {
-        let beforeByPath = Dictionary(
-            previous.directories.map { ($0.path, $0.allocatedBytes) },
-            uniquingKeysWith: { first, _ in first })
+        guard !previous.incomplete, !incomplete else { return [] }
+        let before = Self.allocatedMap(previous.directories)
+        let after = Self.allocatedMap(directories)
+        let paths = Set(before.keys).union(after.keys)
         var result: [DirectoryDelta] = []
-        for directory in directories {
-            let before = beforeByPath[directory.path] ?? 0
-            let delta = directory.allocatedBytes - before
+        for path in paths {
+            let oldBytes = before[path] ?? 0
+            let newBytes = after[path] ?? 0
+            let delta = newBytes - oldBytes
             guard delta != 0 else { continue }
             result.append(
                 DirectoryDelta(
-                    pathID: directory.path,
+                    pathID: path,
                     windowStart: windowStart,
                     windowEnd: scannedAt,
                     deltaAllocatedBytes: delta,
-                    beforeAllocatedBytes: before,
-                    afterAllocatedBytes: directory.allocatedBytes,
+                    beforeAllocatedBytes: oldBytes,
+                    afterAllocatedBytes: newBytes,
                     checkpointID: checkpointID,
-                    calibration: incomplete ? .coverageGap : .calibrated
-                ))
+                    calibration: .calibrated))
         }
-        return result
+        return result.sorted { abs($0.deltaAllocatedBytes) > abs($1.deltaAllocatedBytes) }
+    }
+
+    /// Drops any delta whose ancestor directory is also present, so parent and
+    /// child subtree totals are never summed into one misleading number.
+    public static func nonOverlapping(_ deltas: [DirectoryDelta]) -> [DirectoryDelta] {
+        let paths = Set(deltas.map(\.pathID))
+        return deltas.filter { delta in
+            var ancestor = delta.pathID
+            while let index = ancestor.lastIndex(of: "/"), index != ancestor.startIndex {
+                ancestor = String(ancestor[..<index])
+                if paths.contains(ancestor) { return false }
+            }
+            return !paths.contains("/")
+        }
+    }
+
+    private static func allocatedMap(_ directories: [DirectorySize]) -> [String: Int64] {
+        Dictionary(
+            directories.map { ($0.path, $0.allocatedBytes) },
+            uniquingKeysWith: { first, _ in first })
     }
 }

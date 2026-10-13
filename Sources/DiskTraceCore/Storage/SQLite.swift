@@ -38,6 +38,9 @@ final class SQLiteDatabase {
             throw SQLiteError(message: message, code: rc)
         }
         handle = opened
+        // auto_vacuum only takes effect while the database still has no tables,
+        // so set it before migrations create any.
+        try execute("PRAGMA auto_vacuum=INCREMENTAL;")
         try execute("PRAGMA journal_mode=WAL;")
         try execute("PRAGMA foreign_keys=ON;")
         try execute("PRAGMA busy_timeout=5000;")

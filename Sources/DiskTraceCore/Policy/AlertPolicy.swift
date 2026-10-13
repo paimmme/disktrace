@@ -165,6 +165,7 @@ public enum AlertPolicy {
         }
         let agentPathScoped = evidence.contains {
             $0.source == .agentTaskEvent && ($0.scope == .exactPath || $0.scope == .subtree)
+                && $0.strength >= .moderate
         }
         let agentAny = evidence.contains { $0.source == .agentTaskEvent }
         let processOperation = evidence.contains { $0.isVerifiedProcessOperation }

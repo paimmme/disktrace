@@ -8,6 +8,11 @@ public enum CoverageGapCause: String, Codable, Sendable {
     case permissionDenied
     case manualPause
     case scannerUnavailable
+    /// A session log was truncated, replaced or rotated, so the sync cursor was
+    /// reset and some appended content may not have been observed.
+    case logRotation
+    /// A session log record exceeded the per-record size cap and was skipped.
+    case oversizedRecord
 }
 
 public enum CoverageSeverity: String, Codable, Sendable, Comparable {

@@ -1,45 +1,94 @@
 import Foundation
 
-/// Tiered retention: recent detail, then hourly and daily summaries, bounded by
-/// a soft storage quota. Aggregation is idempotent and never overwrites a
-/// corrupt database — it deletes only reconstructable rows.
+/// Retention is split into two independent concerns:
+///  1. **history pruning** — per-table age rules (and quota-driven row deletion);
+///  2. **space reclamation** — WAL checkpoint and incremental vacuum.
+///
+/// Pruning is driven by deleted row counts and a budget, never by whether the
+/// page count happens to drop. User rules and open (unclosed) coverage gaps are
+/// always protected.
 public struct RetentionPolicy: Sendable {
-    /// Keep raw evidence and per-window deltas this many days.
-    public var detailedDays: Int
-    /// Keep hourly volume summaries this many days (beyond `detailedDays`).
-    public var hourlySummaryDays: Int
-    /// Soft cap across the database, WAL and indexes.
+    public var samplesDetailedDays: Int
+    public var samplesHourlyDays: Int
+    public var deltasDays: Int
+    public var evidenceDays: Int
+    public var decisionsDays: Int
+    public var activitiesDays: Int
+    public var gapsDays: Int
     public var softQuotaBytes: Int64
+    /// Upper bound on rows deleted in one pruning pass.
+    public var maxRowsPerCycle: Int
+    /// Allow `PRAGMA incremental_vacuum` (requires an incremental-auto-vacuum DB).
+    public var incrementalVacuum: Bool
 
     public init(
-        detailedDays: Int = 7,
-        hourlySummaryDays: Int = 90,
-        softQuotaBytes: Int64 = 1_000_000_000
+        samplesDetailedDays: Int = 7,
+        samplesHourlyDays: Int = 90,
+        deltasDays: Int = 90,
+        evidenceDays: Int = 7,
+        decisionsDays: Int = 90,
+        activitiesDays: Int = 90,
+        gapsDays: Int = 90,
+        softQuotaBytes: Int64 = 1_000_000_000,
+        maxRowsPerCycle: Int = 20_000,
+        incrementalVacuum: Bool = true
     ) {
-        self.detailedDays = detailedDays
-        self.hourlySummaryDays = hourlySummaryDays
+        self.samplesDetailedDays = samplesDetailedDays
+        self.samplesHourlyDays = samplesHourlyDays
+        self.deltasDays = deltasDays
+        self.evidenceDays = evidenceDays
+        self.decisionsDays = decisionsDays
+        self.activitiesDays = activitiesDays
+        self.gapsDays = gapsDays
         self.softQuotaBytes = softQuotaBytes
+        self.maxRowsPerCycle = maxRowsPerCycle
+        self.incrementalVacuum = incrementalVacuum
     }
 }
 
-public struct RetentionReport: Sendable, Equatable {
-    public var evidenceDeleted: Int
-    public var deltasDeleted: Int
-    public var samplesDownsampled: Int
-    public var samplesDeletedForQuota: Int
-    public var estimatedBytes: Int64
+/// Storage footprint. Reports **both** the in-use page estimate and the real
+/// file sizes, since they diverge until space is reclaimed.
+public struct SpaceReport: Sendable, Codable, Equatable {
+    public var pageCount: Int64
+    public var freeListPages: Int64
+    public var pageSize: Int64
+    /// `(page_count - freelist_count) * page_size` — allocated to live data.
+    public var effectiveBytes: Int64
+    public var databaseBytes: Int64
+    public var walBytes: Int64
+    public var shmBytes: Int64
 
     public init(
-        evidenceDeleted: Int = 0,
-        deltasDeleted: Int = 0,
-        samplesDownsampled: Int = 0,
-        samplesDeletedForQuota: Int = 0,
-        estimatedBytes: Int64 = 0
+        pageCount: Int64 = 0,
+        freeListPages: Int64 = 0,
+        pageSize: Int64 = 0,
+        effectiveBytes: Int64 = 0,
+        databaseBytes: Int64 = 0,
+        walBytes: Int64 = 0,
+        shmBytes: Int64 = 0
     ) {
-        self.evidenceDeleted = evidenceDeleted
-        self.deltasDeleted = deltasDeleted
-        self.samplesDownsampled = samplesDownsampled
-        self.samplesDeletedForQuota = samplesDeletedForQuota
-        self.estimatedBytes = estimatedBytes
+        self.pageCount = pageCount
+        self.freeListPages = freeListPages
+        self.pageSize = pageSize
+        self.effectiveBytes = effectiveBytes
+        self.databaseBytes = databaseBytes
+        self.walBytes = walBytes
+        self.shmBytes = shmBytes
     }
+
+    public var totalFileBytes: Int64 { databaseBytes + walBytes + shmBytes }
+}
+
+public struct RetentionReport: Sendable, Equatable {
+    public var evidenceDeleted = 0
+    public var deltasDeleted = 0
+    public var decisionsDeleted = 0
+    public var activitiesDeleted = 0
+    public var gapsDeleted = 0
+    public var samplesDownsampled = 0
+    public var rowsDeletedForQuota = 0
+    public var reclaimedBytes: Int64 = 0
+    public var space = SpaceReport()
+
+    public init() {}
 }

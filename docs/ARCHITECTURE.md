@@ -28,6 +28,7 @@ Sources/DiskTraceApp/     read-only SwiftUI app
 | `VolumeSample` | `(volumeID, observedAt, freeBytes, capacityBytes, status)` — volume time-series fact. |
 | `DirectoryDelta` | windowed net allocated change for a normalized path, with `CalibrationStatus` (independent of attribution). |
 | `ChangeHint` | a bounded, coalesced FSEvents clue: *a path changed* — never who or how many bytes. |
+| `SessionSyncState` | per-session-log cursor: file identity, byte offset, size, last processed. |
 | `Evidence` | `(subject, source, scope, strength, identity, limitation)` — attribution support. |
 | `AlertDecision` | `(ruleVersion, subject, action, reason, evidenceClass, evidenceIDs, cooldownKey, evaluatedAt)`. |
 | `CoverageGap` | an interval that could not be fully observed, with cause and severity. |
@@ -42,9 +43,10 @@ up — DiskTrace reports the difference rather than forcing a total.
 `MonitorCoordinator.runOnce()`:
 
 1. **Volume sampling** (never blocked by attribution).
-2. **Drain changes**; an overflow becomes a `CoverageGap(.fseventsOverflow)` and forces recalibration.
-3. **Recalibration** (periodic or forced): scan, diff against the last `ScanResult`, persist `DirectoryDelta`s, build evidence, evaluate policy, persist `AlertDecision`s.
-4. **Retention** (periodic): down-sample old volume samples, delete reconstructable rows, enforce the soft quota.
+2. **Drain changes**; an overflow becomes a `CoverageGap(.fseventsOverflow)` and forces recalibration of every root.
+3. **Incremental session sync** (`AgentActivitySync`): reads only the appended bytes of each Codex session log, upserts activities under a stable id, and commits activities + cursors + gaps in one transaction — before attribution.
+4. **Per-root recalibration**: each root has its own baseline and calibration clock. If either the previous or the current scan is incomplete, **no** trusted delta is produced; a gap is recorded and the last complete baseline is kept so recovery diffs against it.
+5. **Retention**: history pruning and space reclamation run as separate steps.
 
 ## Alert policy (pure function)
 
@@ -58,6 +60,17 @@ up — DiskTrace reports the difference rather than forcing a total.
 - Growth below threshold, active cooldown, or uncertain calibration are silent.
 - **Low space is a separate neutral safety alert**, independent of cause.
 - The policy decides notification only; it never deletes observation history.
+
+## Attribution inputs
+
+- A session log is parsed by a **structure-aware, whitelist** JSON scanner: it
+  reads only named keys from the top level and, for recognised event types, from
+  a `payload` object — never from message/command bodies, and never by searching
+  a whole line for key names. Only hashed session/task ids, a time window, an
+  optional (optionally hashed) working directory and a client kind are stored.
+- An activity window comes from explicit task start **and** end events. An
+  open-ended window (which may include idle time) lowers evidence strength and
+  cannot by itself reach `agent_probable`.
 
 ## ADRs (as implemented)
 

@@ -25,11 +25,24 @@ Legend: **PASS** (executed here), **NOT RUN** (not executed), **BLOCKED**
 - `AlertPolicyTests` — 12 cases covering the decision matrix.
 - `UserRuleTests` — subtree, glob, revoked/expired.
 - `StoreTests` — migration idempotence, sample round-trip/range, delta filter, notifying decisions, rules, state + last-alert.
-- `RetentionTests` — downsampling + evidence deletion, quota pruning.
-- `CodexReaderTests` — privacy (content never stored), hashing, missing home, key whitelist.
+- `RetentionTests` — per-table pruning, open-gap/rule protection, quota + space report.
+- `CodexSyncTests` — privacy (decoys ignored, no content stored), idempotent re-sync, incremental append, truncation reset + gap, oversized-record skip, parser escapes/unicode/nesting, hashed working directory.
+- `DeltaTests` — deleted-directory union, rename = two records, add+delete same window, incomplete ⇒ no delta, non-overlapping selection.
+- `MonitorCompletenessTests` — incomplete recalibration gap + recovery diff, per-root state independence.
 - `FixtureScannerTests` — subtree sizes, exclusions, incomplete-on-permission.
 - `MonitorCoordinatorTests` — silent→alert end-to-end, unavailable-scanner gap, explicit gap.
+- `FullFlowTests` — start agent → append session log + write directories → calibration → database holds the matching activity, delta and decision.
 - `ChangeMonitorTests` — live FSEvents capture, bounded queue.
 - `VolumeSamplerTests` — real volume sample.
 
-Raw evidence: `artifacts/evidence/tests-*.txt`.
+48 tests in 12 suites, all passing. Raw evidence: `artifacts/evidence/tests-*.txt`.
+
+## Continuous-run behaviours (the review's focus)
+
+| Guarantee | Covered by |
+|---|---|
+| No duplicate collection on repeated sync | `CodexSyncTests.idempotentResync` |
+| No missed new task in appended log | `CodexSyncTests.incrementalAppend`, `FullFlowTests` |
+| Permission recovery is not counted as growth | `DeltaTests.incompleteYieldsNothing`, `MonitorCompletenessTests.incompleteThenRecovery` |
+| Truncation/rotation recorded, not silently absorbed | `CodexSyncTests.truncationResets` |
+| Database occupancy is explainable and bounded | `RetentionTests.quotaPrunes` (effective pages + file size) |

@@ -7,21 +7,24 @@ import Foundation
 /// append-only — decisions and rules never delete them.
 public actor DiskTraceStore {
     private let database: SQLiteDatabase
+    private let databasePath: String?
 
     public init(path: String) throws {
         let database = try SQLiteDatabase(path: path)
         try Migrations.migrate(database)
         self.database = database
+        self.databasePath = path == ":memory:" ? nil : path
     }
 
-    private init(database: SQLiteDatabase) {
+    private init(database: SQLiteDatabase, databasePath: String?) {
         self.database = database
+        self.databasePath = databasePath
     }
 
     public static func inMemory() throws -> DiskTraceStore {
         let database = try SQLiteDatabase.inMemory()
         try Migrations.migrate(database)
-        return DiskTraceStore(database: database)
+        return DiskTraceStore(database: database, databasePath: nil)
     }
 
     // MARK: - Inserts
@@ -83,12 +86,55 @@ public actor DiskTraceStore {
 
     public func insert(_ activity: AgentActivity) throws {
         let statement = try database.prepare(
-            "INSERT OR REPLACE INTO agent_activities VALUES (?,?,?,?,?,?);")
+            "INSERT OR REPLACE INTO agent_activities VALUES (?,?,?,?,?,?,?,?);")
         try statement.run([
             .text(activity.id.uuidString), .text(activity.sessionIDHash),
             .text(activity.client.rawValue), .date(activity.startedAt),
             .optionalDate(activity.endedAt), .optionalText(activity.workingDirectory),
+            .optionalText(activity.taskIDHash), .int(activity.windowIsTaskBounded ? 1 : 0),
         ])
+    }
+
+    // MARK: - Session sync (incremental, transactional)
+
+    public func sessionSyncState(path: String) throws -> SessionSyncState? {
+        let statement = try database.prepare("SELECT * FROM session_sync WHERE file_path=?;")
+        guard try statement.run([.text(path)]) else { return nil }
+        return SessionSyncState(
+            filePath: statement.text(0),
+            fileIdentity: statement.text(1),
+            sessionIDHash: statement.optionalText(2),
+            byteOffset: statement.int64(3),
+            fileSize: statement.int64(4),
+            modifiedAt: statement.optionalDate(5),
+            lastProcessed: statement.date(6),
+            workingDirectory: statement.optionalText(7))
+    }
+
+    /// Commits activity upserts, sync-cursor updates and gap records in one
+    /// transaction, so a crash cannot advance a cursor past unrecorded activity.
+    public func applySync(
+        activities: [AgentActivity], states: [SessionSyncState], gaps: [CoverageGap] = []
+    ) throws {
+        try database.transaction {
+            for activity in activities { try insert(activity) }
+            let statement = try database.prepare(
+                """
+                INSERT OR REPLACE INTO session_sync
+                (file_path,file_identity,session_id_hash,byte_offset,file_size,modified_at,last_processed,working_directory)
+                VALUES (?,?,?,?,?,?,?,?);
+                """)
+            for state in states {
+                statement.reset()
+                try statement.run([
+                    .text(state.filePath), .text(state.fileIdentity),
+                    .optionalText(state.sessionIDHash), .int(state.byteOffset),
+                    .int(state.fileSize), .optionalDate(state.modifiedAt),
+                    .date(state.lastProcessed), .optionalText(state.workingDirectory),
+                ])
+            }
+            for gap in gaps { try insert(gap) }
+        }
     }
 
     public func save(_ rule: UserRule) throws {
@@ -220,7 +266,9 @@ public actor DiskTraceStore {
                     client: AgentClientKind(rawValue: statement.text(2)) ?? .unknown,
                     startedAt: statement.date(3),
                     endedAt: statement.optionalDate(4),
-                    workingDirectory: statement.optionalText(5)))
+                    workingDirectory: statement.optionalText(5),
+                    taskIDHash: statement.optionalText(6),
+                    windowIsTaskBounded: statement.int64(7) != 0))
         }
         return result
     }
@@ -249,7 +297,7 @@ public actor DiskTraceStore {
         var counts: [String: Int] = [:]
         for table in [
             "volume_samples", "directory_changes", "evidence", "alert_decisions",
-            "coverage_gaps", "agent_activities", "user_rules",
+            "coverage_gaps", "agent_activities", "user_rules", "session_sync",
         ] {
             let statement = try database.prepare("SELECT COUNT(*) FROM \(table);")
             counts[table] = (try statement.step()) ? statement.int(0) : 0
@@ -257,22 +305,50 @@ public actor DiskTraceStore {
         return counts
     }
 
-    /// Estimated on-disk footprint including the database file (WAL/SHM are
-    /// accounted by the caller through the filesystem).
-    public func estimatedDatabaseBytes() -> Int64 {
+    /// Both the in-use page estimate and the real file sizes (db, WAL, SHM).
+    public func spaceReport() -> SpaceReport {
         var pageCount: Int64 = 0
+        var freeList: Int64 = 0
         var pageSize: Int64 = 0
         if let statement = try? database.prepare("PRAGMA page_count;"),
             (try? statement.step()) == true
         {
             pageCount = statement.int64(0)
         }
+        if let statement = try? database.prepare("PRAGMA freelist_count;"),
+            (try? statement.step()) == true
+        {
+            freeList = statement.int64(0)
+        }
         if let statement = try? database.prepare("PRAGMA page_size;"),
             (try? statement.step()) == true
         {
             pageSize = statement.int64(0)
         }
-        return pageCount * pageSize
+        var databaseBytes: Int64 = 0
+        var walBytes: Int64 = 0
+        var shmBytes: Int64 = 0
+        if let path = databasePath {
+            databaseBytes = Self.fileSize(path)
+            walBytes = Self.fileSize(path + "-wal")
+            shmBytes = Self.fileSize(path + "-shm")
+        }
+        return SpaceReport(
+            pageCount: pageCount, freeListPages: freeList, pageSize: pageSize,
+            effectiveBytes: max(0, pageCount - freeList) * pageSize,
+            databaseBytes: databaseBytes, walBytes: walBytes, shmBytes: shmBytes)
+    }
+
+    private static func fileSize(_ path: String) -> Int64 {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+            let size = attributes[.size] as? NSNumber
+        else { return 0 }
+        return size.int64Value
+    }
+
+    /// Retained for compatibility; equals the in-use page estimate.
+    public func estimatedDatabaseBytes() -> Int64 {
+        spaceReport().effectiveBytes
     }
 
     func rawExecute(_ sql: String, _ values: [SQLiteValue] = []) throws {
@@ -288,42 +364,108 @@ public actor DiskTraceStore {
 
     // MARK: - Retention
 
-    /// Tiered downsampling plus quota enforcement. Idempotent: it only removes
-    /// reconstructable rows and never rewrites surviving observations.
+    /// Prune history by per-table age, then reclaim space. Pruning and
+    /// reclamation are independent: pruning is judged by rows deleted, and
+    /// reclamation by the actual file footprint.
     @discardableResult
     public func applyRetention(_ policy: RetentionPolicy, now: Date) throws -> RetentionReport {
+        var report = try pruneHistory(policy, now: now)
+        let (reclaimed, space) = try reclaimSpace(policy)
+        report.reclaimedBytes = reclaimed
+        report.space = space
+        return report
+    }
+
+    /// Age-based pruning per table, plus bounded quota-driven row deletion.
+    /// User rules and open coverage gaps are never touched.
+    @discardableResult
+    public func pruneHistory(_ policy: RetentionPolicy, now: Date) throws -> RetentionReport {
         var report = RetentionReport()
-        let cutoffDetailed = now.addingTimeInterval(-Double(policy.detailedDays) * 86_400)
-        let cutoffHourly = now.addingTimeInterval(-Double(policy.hourlySummaryDays) * 86_400)
+        func cutoff(_ days: Int) -> SQLiteValue {
+            .date(now.addingTimeInterval(-Double(days) * 86_400))
+        }
+        let cutoffDetailed = now.addingTimeInterval(-Double(policy.samplesDetailedDays) * 86_400)
+        let cutoffHourly = now.addingTimeInterval(-Double(policy.samplesHourlyDays) * 86_400)
 
         report.evidenceDeleted = try deleteCount(
-            "DELETE FROM evidence WHERE observed_at < ?;", [.date(cutoffDetailed)])
+            "DELETE FROM evidence WHERE observed_at < ?;", [cutoff(policy.evidenceDays)])
         report.deltasDeleted = try deleteCount(
-            "DELETE FROM directory_changes WHERE window_end < ?;", [.date(cutoffHourly)])
+            "DELETE FROM directory_changes WHERE window_end < ?;", [cutoff(policy.deltasDays)])
+        report.decisionsDeleted = try deleteCount(
+            "DELETE FROM alert_decisions WHERE evaluated_at < ?;", [cutoff(policy.decisionsDays)])
+        report.activitiesDeleted = try deleteCount(
+            "DELETE FROM agent_activities WHERE started_at < ?;", [cutoff(policy.activitiesDays)])
+        // Open gaps (end_at IS NULL) are protected.
+        report.gapsDeleted = try deleteCount(
+            "DELETE FROM coverage_gaps WHERE end_at IS NOT NULL AND end_at < ?;",
+            [cutoff(policy.gapsDays)])
 
         report.samplesDownsampled += try downsampleVolumeSamples(
             from: cutoffHourly, to: cutoffDetailed, seconds: 3_600)
         report.samplesDownsampled += try downsampleVolumeSamples(
             from: Date(timeIntervalSince1970: 0), to: cutoffHourly, seconds: 86_400)
 
-        var bytes = estimatedDatabaseBytes()
+        report.rowsDeletedForQuota = try enforceQuota(policy)
+        report.space = spaceReport()
+        return report
+    }
+
+    /// Deletes oldest rows across tables in batches until the in-use page
+    /// estimate is within the soft quota or the per-cycle budget is exhausted.
+    /// It does not require the page count to fall — deletes move pages to the
+    /// freelist, which already lowers `effectiveBytes`.
+    private func enforceQuota(_ policy: RetentionPolicy) throws -> Int {
+        var deleted = 0
+        var space = spaceReport()
         var guardCounter = 0
-        while bytes > policy.softQuotaBytes && guardCounter < 1_000 {
+        while space.effectiveBytes > policy.softQuotaBytes
+            && deleted < policy.maxRowsPerCycle && guardCounter < 200
+        {
             guardCounter += 1
-            let removedSamples = try deleteCount(
+            var batch = 0
+            batch += try deleteCount(
                 "DELETE FROM volume_samples WHERE id IN (SELECT id FROM volume_samples ORDER BY observed_at ASC LIMIT 500);",
                 [])
-            let removedDeltas = try deleteCount(
+            batch += try deleteCount(
                 "DELETE FROM directory_changes WHERE id IN (SELECT id FROM directory_changes ORDER BY window_end ASC LIMIT 500);",
                 [])
-            if removedSamples == 0 && removedDeltas == 0 { break }
-            report.samplesDeletedForQuota += removedSamples + removedDeltas
-            let next = estimatedDatabaseBytes()
-            if next >= bytes { break }
-            bytes = next
+            batch += try deleteCount(
+                "DELETE FROM alert_decisions WHERE id IN (SELECT id FROM alert_decisions ORDER BY evaluated_at ASC LIMIT 500);",
+                [])
+            batch += try deleteCount(
+                "DELETE FROM evidence WHERE id IN (SELECT id FROM evidence ORDER BY observed_at ASC LIMIT 500);",
+                [])
+            if batch == 0 { break }
+            deleted += batch
+            let next = spaceReport()
+            if next.effectiveBytes >= space.effectiveBytes && next.pageCount == space.pageCount {
+                // No progress from deletion (e.g. all rows protected); stop.
+                space = next
+                break
+            }
+            space = next
         }
-        report.estimatedBytes = bytes
-        return report
+        return deleted
+    }
+
+    /// Space reclamation, separate from pruning: checkpoint the WAL (deferred if
+    /// a reader holds it) and optionally run an incremental vacuum. A full
+    /// `VACUUM` is deliberately never run automatically.
+    public func reclaimSpace(_ policy: RetentionPolicy) throws -> (Int64, SpaceReport) {
+        let before = spaceReport()
+        try? database.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        if policy.incrementalVacuum, isIncrementalAutoVacuum {
+            try? database.execute("PRAGMA incremental_vacuum;")
+        }
+        let after = spaceReport()
+        return (max(0, before.totalFileBytes - after.totalFileBytes), after)
+    }
+
+    private var isIncrementalAutoVacuum: Bool {
+        guard let statement = try? database.prepare("PRAGMA auto_vacuum;"),
+            (try? statement.step()) == true
+        else { return false }
+        return statement.int(0) >= 1
     }
 
     private func deleteCount(_ sql: String, _ values: [SQLiteValue]) throws -> Int {

@@ -46,20 +46,25 @@ struct DiskTraceAgentMain {
                 roots: roots,
                 exclusions: options.exclusions,
                 sampleInterval: options.interval)
+            let activitySync = AgentActivitySync(
+                configuration: CodexIntegrationConfiguration(
+                    codexHome: options.codexHome,
+                    hashWorkingDirectory: options.hashCodexPaths))
             let coordinator = MonitorCoordinator(
                 config: config,
                 store: store,
                 scanner: FixtureScanner(),
-                scannerName: "fixture")
+                scannerName: "fixture",
+                activitySync: activitySync)
 
             signal(SIGTERM) { _ in stopFlag.set() }
             signal(SIGINT) { _ in stopFlag.set() }
 
             fputs("disktrace-agent starting; db=\(databaseURL.path)\n", stderr)
             for root in roots { fputs("  monitoring root: \(root.path)\n", stderr) }
+            fputs("  codex sessions: \(options.resolvedCodexHome.path)\n", stderr)
 
             try await coordinator.start()
-            try await refreshCodexActivities(store: store)
 
             while true {
                 let report = try await coordinator.runOnce()
@@ -82,12 +87,8 @@ struct DiskTraceAgentMain {
     }
 
     private static func refreshCodexActivities(store: DiskTraceStore) async throws {
-        let reader = CodexSessionReader()
-        let since = Date().addingTimeInterval(-7 * 86_400)
-        let activities = (try? await reader.recentActivities(since: since)) ?? []
-        for activity in activities {
-            try await store.insert(activity)
-        }
+        // Superseded by AgentActivitySync, which runs every cycle inside the
+        // coordinator. Kept as a no-op reference point.
     }
 }
 
@@ -97,6 +98,14 @@ struct AgentOptions {
     var exclusions: [String] = []
     var interval: TimeInterval = 60
     var once = false
+    var codexHome: URL?
+    var hashCodexPaths = false
+
+    var resolvedCodexHome: URL {
+        codexHome
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appending(path: ".codex", directoryHint: .isDirectory)
+    }
 
     static func parse(_ arguments: [String]) -> AgentOptions {
         var options = AgentOptions()
@@ -116,6 +125,10 @@ struct AgentOptions {
                 if let value = next() { options.exclusions.append(value) }
             case "--interval":
                 if let value = next(), let seconds = TimeInterval(value) { options.interval = seconds }
+            case "--codex-home":
+                if let value = next() { options.codexHome = URL(filePath: value) }
+            case "--hash-codex-paths":
+                options.hashCodexPaths = true
             case "--once":
                 options.once = true
             default:

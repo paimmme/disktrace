@@ -1,3 +1,1 @@
-✔ Test "coalesced queue never exceeds its capacity" passed after 0.663 seconds.
-✔ Suite "Change monitor (live FSEvents)" passed after 0.663 seconds.
-✔ Test run with 36 tests in 9 suites passed after 0.663 seconds.
+✔ Test run with 48 tests in 12 suites passed after 0.671 seconds.
