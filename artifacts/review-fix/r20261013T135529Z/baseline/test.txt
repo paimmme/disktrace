@@ -1,0 +1,3 @@
+✔ Test "C16: with 401 logs no file is permanently starved" passed after 0.747 seconds.
+✔ Suite "Codex real envelope (C-series)" passed after 0.748 seconds.
+✔ Test run with 88 tests in 17 suites passed after 0.748 seconds.

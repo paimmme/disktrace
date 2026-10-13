@@ -1,0 +1,349 @@
+== schema ==
+CREATE TABLE schema_version (
+    version INTEGER NOT NULL
+);
+CREATE TABLE volume_samples (
+    id TEXT PRIMARY KEY,
+    volume_id TEXT NOT NULL,
+    observed_at REAL NOT NULL,
+    free_bytes INTEGER NOT NULL,
+    capacity_bytes INTEGER NOT NULL,
+    status TEXT NOT NULL
+);
+CREATE INDEX idx_volume_samples ON volume_samples(volume_id, observed_at);
+CREATE TABLE directory_changes (
+    id TEXT PRIMARY KEY,
+    path_id TEXT NOT NULL,
+    window_start REAL NOT NULL,
+    window_end REAL NOT NULL,
+    delta_allocated_bytes INTEGER NOT NULL,
+    before_allocated_bytes INTEGER NOT NULL,
+    after_allocated_bytes INTEGER NOT NULL,
+    checkpoint_id INTEGER NOT NULL,
+    calibration TEXT NOT NULL
+, scan_id TEXT);
+CREATE INDEX idx_directory_changes ON directory_changes(path_id, window_end);
+CREATE TABLE agent_activities (
+    id TEXT PRIMARY KEY,
+    session_id_hash TEXT NOT NULL,
+    client TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    working_directory TEXT
+, task_id_hash TEXT, window_is_task_bounded INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX idx_agent_activities ON agent_activities(session_id_hash, started_at);
+CREATE TABLE evidence (
+    id TEXT PRIMARY KEY,
+    subject_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    strength INTEGER NOT NULL,
+    identity TEXT,
+    observed_at REAL NOT NULL,
+    limitation TEXT NOT NULL
+);
+CREATE INDEX idx_evidence_subject ON evidence(subject_id);
+CREATE TABLE alert_decisions (
+    id TEXT PRIMARY KEY,
+    rule_version TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_class TEXT NOT NULL,
+    evidence_ids TEXT NOT NULL,
+    cooldown_key TEXT,
+    evaluated_at REAL NOT NULL
+);
+CREATE INDEX idx_alert_decisions ON alert_decisions(subject_id, evaluated_at);
+CREATE TABLE coverage_gaps (
+    id TEXT PRIMARY KEY,
+    start_at REAL NOT NULL,
+    end_at REAL,
+    cause TEXT NOT NULL,
+    affected_roots TEXT NOT NULL,
+    severity TEXT NOT NULL
+);
+CREATE TABLE user_rules (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    path_pattern TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL,
+    explanation TEXT NOT NULL,
+    is_revoked INTEGER NOT NULL
+);
+CREATE TABLE monitor_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE session_sync (
+    file_path TEXT PRIMARY KEY,
+    file_identity TEXT NOT NULL,
+    session_id_hash TEXT,
+    byte_offset INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    modified_at REAL,
+    last_processed REAL NOT NULL
+, working_directory TEXT, cursor_version INTEGER NOT NULL DEFAULT 0, discarding_oversized INTEGER NOT NULL DEFAULT 0, first_event_at REAL, last_event_at REAL, last_error TEXT, retry_after REAL, last_scheduled_at REAL);
+CREATE TABLE task_windows (
+    activity_id TEXT PRIMARY KEY,
+    session_hash TEXT NOT NULL,
+    task_hash TEXT NOT NULL,
+    client_kind TEXT NOT NULL,
+    client_version TEXT,
+    lifecycle_state TEXT NOT NULL,
+    start_known INTEGER NOT NULL,
+    end_known INTEGER NOT NULL,
+    last_event_at REAL NOT NULL,
+    schema_kind TEXT NOT NULL,
+    verification_state TEXT NOT NULL,
+    source_log_path TEXT NOT NULL,
+    event_start_offset INTEGER,
+    event_end_offset INTEGER,
+    FOREIGN KEY(activity_id) REFERENCES agent_activities(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_task_windows_session_task ON task_windows(session_hash, task_hash);
+CREATE INDEX idx_task_windows_recent ON task_windows(last_event_at, lifecycle_state);
+CREATE TABLE client_verification (
+    client_kind TEXT NOT NULL,
+    client_version TEXT NOT NULL,
+    schema_kind TEXT NOT NULL,
+    result TEXT NOT NULL,
+    verified_at REAL,
+    evidence_reference TEXT,
+    PRIMARY KEY(client_kind, client_version, schema_kind)
+);
+CREATE TABLE monitored_roots (
+    id TEXT PRIMARY KEY,
+    canonical_path TEXT NOT NULL UNIQUE,
+    volume_id TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    config_revision INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE root_scans (
+    id TEXT PRIMARY KEY,
+    root_id TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    state TEXT NOT NULL,
+    entry_count INTEGER NOT NULL DEFAULT 0,
+    incomplete_reason TEXT,
+    start_event_id TEXT,
+    end_event_id TEXT,
+    FOREIGN KEY(root_id) REFERENCES monitored_roots(id)
+);
+CREATE INDEX idx_root_scans_root_time ON root_scans(root_id, started_at);
+CREATE TABLE root_health (
+    root_id TEXT PRIMARY KEY,
+    active_scan_id TEXT,
+    state TEXT NOT NULL,
+    last_success_at REAL,
+    next_retry_at REAL,
+    open_gap_id TEXT,
+    inventory_coverage TEXT NOT NULL DEFAULT 'pending',
+    FOREIGN KEY(root_id) REFERENCES monitored_roots(id)
+);
+CREATE TABLE change_hints (
+    id TEXT PRIMARY KEY,
+    root_id TEXT NOT NULL,
+    volume_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    flags INTEGER NOT NULL,
+    first_observed_at REAL NOT NULL,
+    last_observed_at REAL NOT NULL,
+    replayed INTEGER NOT NULL DEFAULT 0,
+    processing_state TEXT NOT NULL,
+    FOREIGN KEY(root_id) REFERENCES monitored_roots(id),
+    UNIQUE(volume_id, event_id, path)
+);
+CREATE INDEX idx_hints_pending ON change_hints(processing_state, first_observed_at);
+CREATE TABLE event_checkpoints (
+    volume_id TEXT PRIMARY KEY,
+    stream_kind TEXT NOT NULL,
+    volume_identity TEXT NOT NULL,
+    last_durable_event_id TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE file_inventory (
+    root_id TEXT NOT NULL,
+    scan_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    file_identity TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    logical_bytes INTEGER,
+    allocated_bytes INTEGER,
+    modified_at REAL,
+    birth_at REAL,
+    observed_at REAL NOT NULL,
+    link_count INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(root_id, scan_id, path),
+    FOREIGN KEY(root_id) REFERENCES monitored_roots(id),
+    FOREIGN KEY(scan_id) REFERENCES root_scans(id)
+);
+CREATE INDEX idx_inventory_identity ON file_inventory(root_id, scan_id, file_identity);
+CREATE TABLE file_changes (
+    id TEXT PRIMARY KEY,
+    root_id TEXT NOT NULL,
+    scan_id TEXT,
+    path_before TEXT,
+    path_after TEXT,
+    identity_before TEXT,
+    identity_after TEXT,
+    change_kind TEXT NOT NULL,
+    window_start REAL NOT NULL,
+    window_end REAL NOT NULL,
+    observed_at REAL NOT NULL,
+    before_logical INTEGER,
+    after_logical INTEGER,
+    before_allocated INTEGER,
+    after_allocated INTEGER,
+    delta_allocated INTEGER,
+    measurement_state TEXT NOT NULL,
+    timing_precision TEXT NOT NULL,
+    evidence_version INTEGER NOT NULL,
+    FOREIGN KEY(root_id) REFERENCES monitored_roots(id),
+    FOREIGN KEY(scan_id) REFERENCES root_scans(id)
+);
+CREATE INDEX idx_file_changes_root_time ON file_changes(root_id, observed_at);
+CREATE INDEX idx_file_changes_paths ON file_changes(path_after, observed_at);
+CREATE TABLE pending_path_work (
+    root_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    work_kind TEXT NOT NULL,
+    first_dirty_at REAL NOT NULL,
+    last_dirty_at REAL NOT NULL,
+    next_attempt_at REAL NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(root_id, path, work_kind)
+);
+CREATE TABLE scan_directory_summaries (
+    scan_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    allocated_bytes INTEGER,
+    file_count INTEGER NOT NULL,
+    PRIMARY KEY(scan_id, path),
+    FOREIGN KEY(scan_id) REFERENCES root_scans(id) ON DELETE CASCADE
+);
+CREATE TABLE volume_measurement_context (
+    sample_id TEXT PRIMARY KEY,
+    method TEXT NOT NULL,
+    FOREIGN KEY(sample_id) REFERENCES volume_samples(id) ON DELETE CASCADE
+);
+CREATE TABLE storage_events (
+    id TEXT PRIMARY KEY,
+    root_id TEXT NOT NULL,
+    scope_path TEXT NOT NULL,
+    window_start REAL NOT NULL,
+    window_end REAL NOT NULL,
+    gross_added_bytes INTEGER,
+    gross_removed_bytes INTEGER,
+    net_bytes INTEGER,
+    measurement_state TEXT NOT NULL,
+    reason_category TEXT NOT NULL,
+    attribution_class TEXT NOT NULL,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    unassigned_bytes INTEGER,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(root_id) REFERENCES monitored_roots(id)
+);
+CREATE INDEX idx_storage_events_time ON storage_events(window_end, root_id);
+CREATE TABLE event_files (
+    event_id TEXT NOT NULL,
+    change_id TEXT NOT NULL,
+    PRIMARY KEY(event_id, change_id),
+    FOREIGN KEY(event_id) REFERENCES storage_events(id) ON DELETE CASCADE,
+    FOREIGN KEY(change_id) REFERENCES file_changes(id) ON DELETE CASCADE
+);
+CREATE TABLE task_links (
+    event_id TEXT NOT NULL,
+    activity_id TEXT NOT NULL,
+    link_state TEXT NOT NULL,
+    link_basis TEXT NOT NULL,
+    candidate_bytes INTEGER,
+    algorithm_version TEXT NOT NULL,
+    limitation TEXT NOT NULL,
+    PRIMARY KEY(event_id, activity_id, algorithm_version),
+    FOREIGN KEY(event_id) REFERENCES storage_events(id) ON DELETE CASCADE,
+    FOREIGN KEY(activity_id) REFERENCES agent_activities(id) ON DELETE CASCADE
+);
+CREATE TABLE presence_checks (
+    change_id TEXT NOT NULL,
+    scheduled_at REAL NOT NULL,
+    checked_at REAL,
+    result TEXT NOT NULL,
+    current_identity TEXT,
+    current_allocated INTEGER,
+    PRIMARY KEY(change_id, scheduled_at),
+    FOREIGN KEY(change_id) REFERENCES file_changes(id) ON DELETE CASCADE
+);
+CREATE TABLE notification_outbox (
+    id TEXT PRIMARY KEY,
+    decision_id TEXT NOT NULL,
+    event_id TEXT,
+    category TEXT NOT NULL,
+    delivery_state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    attempted_at REAL,
+    delivered_at REAL,
+    failure_code TEXT,
+    FOREIGN KEY(decision_id) REFERENCES alert_decisions(id) ON DELETE CASCADE,
+    FOREIGN KEY(event_id) REFERENCES storage_events(id) ON DELETE SET NULL
+);
+CREATE INDEX idx_notification_pending ON notification_outbox(delivery_state, expires_at);
+CREATE TABLE notification_policy_state (
+    key TEXT PRIMARY KEY,
+    severity TEXT NOT NULL,
+    last_sent_at REAL,
+    recovered_samples INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE command_receipts (
+    request_id TEXT PRIMARY KEY,
+    command TEXT NOT NULL,
+    result TEXT NOT NULL,
+    detail_code TEXT,
+    applied_revision INTEGER,
+    processed_at REAL NOT NULL
+);
+CREATE TABLE event_feedback (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    feedback_kind TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    revoked_at REAL,
+    FOREIGN KEY(event_id) REFERENCES storage_events(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_feedback_active ON event_feedback(event_id, revoked_at);
+== indexes ==
+idx_volume_samples|volume_samples|CREATE INDEX idx_volume_samples ON volume_samples(volume_id, observed_at)
+idx_directory_changes|directory_changes|CREATE INDEX idx_directory_changes ON directory_changes(path_id, window_end)
+idx_agent_activities|agent_activities|CREATE INDEX idx_agent_activities ON agent_activities(session_id_hash, started_at)
+idx_evidence_subject|evidence|CREATE INDEX idx_evidence_subject ON evidence(subject_id)
+idx_alert_decisions|alert_decisions|CREATE INDEX idx_alert_decisions ON alert_decisions(subject_id, evaluated_at)
+idx_task_windows_session_task|task_windows|CREATE INDEX idx_task_windows_session_task ON task_windows(session_hash, task_hash)
+idx_task_windows_recent|task_windows|CREATE INDEX idx_task_windows_recent ON task_windows(last_event_at, lifecycle_state)
+idx_root_scans_root_time|root_scans|CREATE INDEX idx_root_scans_root_time ON root_scans(root_id, started_at)
+idx_hints_pending|change_hints|CREATE INDEX idx_hints_pending ON change_hints(processing_state, first_observed_at)
+idx_inventory_identity|file_inventory|CREATE INDEX idx_inventory_identity ON file_inventory(root_id, scan_id, file_identity)
+idx_file_changes_root_time|file_changes|CREATE INDEX idx_file_changes_root_time ON file_changes(root_id, observed_at)
+idx_file_changes_paths|file_changes|CREATE INDEX idx_file_changes_paths ON file_changes(path_after, observed_at)
+idx_storage_events_time|storage_events|CREATE INDEX idx_storage_events_time ON storage_events(window_end, root_id)
+idx_notification_pending|notification_outbox|CREATE INDEX idx_notification_pending ON notification_outbox(delivery_state, expires_at)
+idx_feedback_active|event_feedback|CREATE INDEX idx_feedback_active ON event_feedback(event_id, revoked_at)
+== pragmas ==
+wal
+0
+2
+82
+0
+4096
+== integrity ==
+ok
+== files ==
+-rw-r--r--@     1 wangjie  staff  335872 Oct 13 06:55 db.sqlite

@@ -196,6 +196,11 @@ extension DiskTraceStore {
     }
 
     private func loadDirectorySummaries(scanID: UUID) throws -> [String: Int64] {
+        try directorySummaries(scanID: scanID)
+    }
+
+    /// Root-scoped directory summaries for one scan generation (public for tests).
+    public func directorySummaries(scanID: UUID) throws -> [String: Int64] {
         let statement = try database.prepare(
             "SELECT path, allocated_bytes FROM scan_directory_summaries WHERE scan_id=?;")
         try statement.bind([.text(scanID.uuidString)])
@@ -204,6 +209,19 @@ extension DiskTraceStore {
             result[statement.text(0)] = statement.isNull(1) ? 0 : statement.int64(1)
         }
         return result
+    }
+
+    /// The root that owns a scan generation, or nil if the row is gone.
+    public func scanOwner(scanID: UUID) throws -> UUID? {
+        let statement = try database.prepare("SELECT root_id FROM root_scans WHERE id=?;")
+        guard try statement.run([.text(scanID.uuidString)]) else { return nil }
+        return UUID(uuidString: statement.text(0))
+    }
+
+    public func inventoryCount(rootID: UUID, scanID: UUID) throws -> Int {
+        try count(
+            "SELECT COUNT(*) FROM file_inventory WHERE root_id=? AND scan_id=?;",
+            [.text(rootID.uuidString), .text(scanID.uuidString)])
     }
 
     private func scanEndedAt(scanID: UUID) throws -> Date? {
@@ -230,7 +248,15 @@ extension DiskTraceStore {
         let entryCount = try count(
             "SELECT COUNT(*) FROM file_inventory WHERE scan_id=?;", [.text(scanID.uuidString)])
 
-        guard let previous = health?.activeScanID else {
+        // Only trust a previous generation that actually belongs to this root.
+        // A corrupt or mis-referenced health row must not let us diff/delete
+        // across roots.
+        var previousScanID = health?.activeScanID
+        if let previous = previousScanID, try scanOwner(scanID: previous) != rootID {
+            previousScanID = nil
+        }
+
+        guard let previous = previousScanID else {
             // First complete scan: establish the baseline, emit nothing.
             try database.transaction {
                 try rawExecute(
@@ -272,12 +298,17 @@ extension DiskTraceStore {
                 "UPDATE root_scans SET state='completed', ended_at=?, entry_count=? WHERE id=?;",
                 [.date(date), .int(Int64(entryCount)), .text(scanID.uuidString)])
             // Reclaim the previous generation (active + at most one preparing).
+            // Both deletes are root-scoped: a scan of root B must never remove
+            // root A's inventory or directory summaries.
             try rawExecute(
                 "DELETE FROM file_inventory WHERE root_id=? AND scan_id<>?;",
                 [.text(rootID.uuidString), .text(scanID.uuidString)])
             try rawExecute(
-                "DELETE FROM scan_directory_summaries WHERE scan_id<>?;",
-                [.text(scanID.uuidString)])
+                """
+                DELETE FROM scan_directory_summaries
+                WHERE scan_id IN (SELECT id FROM root_scans WHERE root_id=? AND id<>?);
+                """,
+                [.text(rootID.uuidString), .text(scanID.uuidString)])
             try setRootHealth(
                 rootID: rootID, state: .ready, activeScanID: scanID, lastSuccessAt: date,
                 nextRetryAt: nil, coverage: "complete")
@@ -507,5 +538,21 @@ extension DiskTraceStore {
 
     public func markAllHintsProcessed() throws {
         try rawExecute("UPDATE change_hints SET processing_state='processed';")
+    }
+
+    /// `PRAGMA integrity_check` — "ok" on a healthy database.
+    public func integrityCheck() throws -> [String] {
+        let statement = try database.prepare("PRAGMA integrity_check;")
+        var result: [String] = []
+        while try statement.step() { result.append(statement.text(0)) }
+        return result
+    }
+
+    /// `PRAGMA foreign_key_check` — empty on a healthy database.
+    public func foreignKeyViolations() throws -> [String] {
+        let statement = try database.prepare("PRAGMA foreign_key_check;")
+        var result: [String] = []
+        while try statement.step() { result.append(statement.text(0)) }
+        return result
     }
 }
