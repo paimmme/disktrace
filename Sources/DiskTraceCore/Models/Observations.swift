@@ -6,6 +6,13 @@ public enum AvailabilityStatus: String, Codable, Sendable {
     case unavailable
 }
 
+/// How a volume sample's free/capacity were measured. Two methods must never be
+/// compared as a precise delta.
+public enum VolumeMethod: String, Codable, Sendable {
+    case importantUsage
+    case statfsAvailable
+}
+
 /// Volume-level time-series fact. Free space, monitored-directory net growth
 /// and write I/O bytes are distinct metrics and are never reconciled into one.
 public struct VolumeSample: Codable, Sendable, Hashable, Identifiable {
@@ -105,6 +112,9 @@ public struct ChangeHint: Codable, Sendable, Hashable, Identifiable {
     public let eventID: UInt64
     public let path: String
     public let flag: ChangeFlag
+    /// Raw FSEvents flags, preserved because a single `ChangeFlag` loses
+    /// combinations (e.g. created + removed in one window).
+    public let rawFlags: UInt32
     public let observedAt: Date
 
     public init(
@@ -112,13 +122,21 @@ public struct ChangeHint: Codable, Sendable, Hashable, Identifiable {
         eventID: UInt64,
         path: String,
         flag: ChangeFlag,
+        rawFlags: UInt32 = 0,
         observedAt: Date
     ) {
         self.id = id
         self.eventID = eventID
         self.path = path
         self.flag = flag
+        self.rawFlags = rawFlags
         self.observedAt = observedAt
+    }
+
+    public func withEventID(_ eventID: UInt64, flag: ChangeFlag, observedAt: Date) -> ChangeHint {
+        ChangeHint(
+            id: id, eventID: eventID, path: path, flag: flag, rawFlags: rawFlags,
+            observedAt: observedAt)
     }
 }
 
@@ -126,11 +144,13 @@ public struct ChangeHint: Codable, Sendable, Hashable, Identifiable {
 public enum StorageObservation: Sendable, Hashable {
     case volume(VolumeSample)
     case directory(DirectoryDelta)
+    case event(StorageEvent)
 
     public var observedAt: Date {
         switch self {
         case .volume(let sample): return sample.observedAt
         case .directory(let delta): return delta.windowEnd
+        case .event(let event): return event.windowEnd
         }
     }
 
@@ -138,6 +158,7 @@ public enum StorageObservation: Sendable, Hashable {
         switch self {
         case .volume(let sample): return sample.id
         case .directory(let delta): return delta.id
+        case .event(let event): return event.id
         }
     }
 
@@ -145,6 +166,7 @@ public enum StorageObservation: Sendable, Hashable {
         switch self {
         case .volume: return nil
         case .directory(let delta): return delta.pathID
+        case .event(let event): return event.scopePath
         }
     }
 
@@ -153,6 +175,7 @@ public enum StorageObservation: Sendable, Hashable {
         switch self {
         case .volume: return 0
         case .directory(let delta): return delta.growthBytes
+        case .event(let event): return max(0, event.netBytes ?? 0)
         }
     }
 }

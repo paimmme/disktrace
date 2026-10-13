@@ -1,0 +1,18 @@
+{
+  "generatedAtUTC": "2026-10-13T13:21:14Z",
+  "commit": "7779285815dd25ee1d92f862b1db9e4e02cd7a80",
+  "workspace": "uncommitted changes present (UI, read-only connection, M1-M8 work); not committed or pushed",
+  "os": "14.6",
+  "arch": "arm64",
+  "swift": "6.2 (extracted toolchain) + CLT 15.0 SDK",
+  "schemaVersion": 6,
+  "evidenceVersion": 1,
+  "automatedTests": "88 passed / 16 suites",
+  "testLine": "✔ Test run with 88 tests in 17 suites passed after 0.720 seconds.",
+  "acceptanceScript": "scripts/acceptance-original-need.sh -> all assertions PASS",
+  "realClientVerification": "NOT RUN (no verified Codex client)",
+  "notifications": "NOT RUN (sink implemented; real delivery unverified)",
+  "loginRecovery": "NOT RUN",
+  "resource24h": "NOT RUN",
+  "release": "NOT READY (no signing/notarization/dual-arch)"
+}

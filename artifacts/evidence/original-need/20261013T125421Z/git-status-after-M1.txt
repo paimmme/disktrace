@@ -1,0 +1,20 @@
+ M README.md
+ M Sources/DiskTraceApp/AppModel.swift
+ M Sources/DiskTraceApp/DiskTraceApp.swift
+ M Sources/DiskTraceCore/Codex/CodexActivitySync.swift
+ M Sources/DiskTraceCore/Codex/CodexJSON.swift
+ M Sources/DiskTraceCore/Codex/CodexSessionLog.swift
+ M Sources/DiskTraceCore/Models/CoverageGap.swift
+ M Sources/DiskTraceCore/Models/SessionSyncState.swift
+ M Sources/DiskTraceCore/Storage/DiskTraceStore.swift
+ M Sources/DiskTraceCore/Storage/Migrations.swift
+ M Sources/DiskTraceCore/Storage/SQLite.swift
+ M Tests/DiskTraceCoreTests/CodexSyncTests.swift
+ M docs/LIMITATIONS.md
+ M scripts/toolchain-env.sh
+?? Sources/DiskTraceCore/Models/TaskWindow.swift
+?? Tests/DiskTraceCoreTests/CodexEnvelopeTests.swift
+?? Tests/DiskTraceCoreTests/ReadOnlySnapshotTests.swift
+?? artifacts/evidence/original-need/
+?? docs/PRODUCT_STATUS.md
+?? docs/implementation/

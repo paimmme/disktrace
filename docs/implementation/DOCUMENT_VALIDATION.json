@@ -1,0 +1,11 @@
+{
+  "sqlBlocksValidatedInMemory": 5,
+  "sqlIntegrityCheck": "ok",
+  "jsonExamplesValidated": 3,
+  "automatedScenarios": 66,
+  "realMacScenarios": 12,
+  "markdownFences": "balanced",
+  "sourceFilesHashed": 45,
+  "documentLines": 1516,
+  "documentBytes": 103909
+}

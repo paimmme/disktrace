@@ -8,15 +8,27 @@ public struct CodexIntegrationConfiguration: Sendable {
     public var maxFilesPerSync: Int
     /// Upper bound on bytes read per sync, across all files.
     public var byteBudgetPerSync: Int
+    /// Upper bound on bytes read from a single file per sync.
+    public var perFileBudgetBytes: Int
     /// A single log record larger than this is skipped (and a gap recorded).
     public var maxRecordBytes: Int
+    /// Only enumerate session logs modified within this many days.
+    public var lookbackDays: Int
+    /// How often the log directory is enumerated.
+    public var discoveryInterval: TimeInterval
+    /// Hard cap on files held from one enumeration.
+    public var maxDiscoveredFiles: Int
 
     public init(
         codexHome: URL? = nil,
         hashWorkingDirectory: Bool = false,
         maxFilesPerSync: Int = 200,
         byteBudgetPerSync: Int = 512 * 1024,
-        maxRecordBytes: Int = 512 * 1024
+        perFileBudgetBytes: Int = 64 * 1024,
+        maxRecordBytes: Int = 512 * 1024,
+        lookbackDays: Int = 7,
+        discoveryInterval: TimeInterval = 30,
+        maxDiscoveredFiles: Int = 2000
     ) {
         self.codexHome =
             codexHome
@@ -25,7 +37,11 @@ public struct CodexIntegrationConfiguration: Sendable {
         self.hashWorkingDirectory = hashWorkingDirectory
         self.maxFilesPerSync = maxFilesPerSync
         self.byteBudgetPerSync = byteBudgetPerSync
+        self.perFileBudgetBytes = perFileBudgetBytes
         self.maxRecordBytes = maxRecordBytes
+        self.lookbackDays = lookbackDays
+        self.discoveryInterval = discoveryInterval
+        self.maxDiscoveredFiles = maxDiscoveredFiles
     }
 
     public var sessionsDirectory: URL {
@@ -34,64 +50,114 @@ public struct CodexIntegrationConfiguration: Sendable {
 }
 
 /// Chunked, bounded reader for a JSONL session log. It never loads a whole file:
-/// it reads at most `budget` bytes from a stored offset, emits only complete
-/// lines, and carries a trailing partial line to the next call. An oversized
-/// single record is dropped and counted so the caller can record a gap.
+/// it reads at most `budget` bytes from a read position, emits only complete
+/// lines with their absolute offsets, and carries the trailing partial line to
+/// the next call. A record (or partial tail) larger than `maxRecordBytes` is
+/// dropped and flagged so the caller can record exactly one gap and, if needed,
+/// resume discarding after a restart.
 enum CodexSessionLog {
-    struct Chunk {
-        var lines: [Data]
-        var readPosition: Int64
-        var carry: Data
-        var skippedOversized: Int
-        var bytesRead: Int
+    struct Line {
+        let data: Data
+        /// Absolute file offset where the line starts.
+        let startOffset: Int64
+        /// Absolute file offset just after the terminating newline.
+        let endOffset: Int64
+    }
 
-        static let empty = Chunk(
-            lines: [], readPosition: 0, carry: Data(), skippedOversized: 0, bytesRead: 0)
+    struct Chunk {
+        var lines: [Line]
+        /// Absolute offset read up to (bytes fetched), which may include a
+        /// partial trailing line.
+        var readPosition: Int64
+        /// Candidate committed offset: after the last complete line, or advanced
+        /// past a dropped oversized record.
+        var committedOffset: Int64
+        var carry: Data
+        /// Absolute offset where `carry` begins.
+        var carryStart: Int64
+        var oversizedComplete: Int
+        var oversizedPartial: Bool
+        var bytesRead: Int
     }
 
     static func read(
         file: URL,
-        from position: Int64,
+        readPosition: Int64,
         carry: Data,
+        carryStart: Int64,
         budget: Int,
         maxRecordBytes: Int
     ) throws -> Chunk {
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
-        try handle.seek(toOffset: UInt64(max(0, position)))
+        try handle.seek(toOffset: UInt64(max(0, readPosition)))
         let data = (try handle.read(upToCount: max(1, budget))) ?? Data()
         if data.isEmpty {
             return Chunk(
-                lines: [], readPosition: position, carry: carry, skippedOversized: 0, bytesRead: 0)
+                lines: [], readPosition: readPosition, committedOffset: carryStart,
+                carry: carry, carryStart: carryStart, oversizedComplete: 0,
+                oversizedPartial: false, bytesRead: 0)
         }
-        let newReadPosition = position + Int64(data.count)
-
+        let newReadPosition = readPosition + Int64(data.count)
         var buffer = carry
         buffer.append(data)
+        let bufferBase = carryStart
 
-        var lines: [Data] = []
-        var lineStart = buffer.startIndex
-        var lastNewlineEnd = buffer.startIndex
+        var lines: [Line] = []
+        var oversizedComplete = 0
         var index = buffer.startIndex
+        var lineStart = buffer.startIndex
+        var lastNewlineEndIndex: Data.Index?
+        var lastNewlineEndAbs: Int64?
+
         while index < buffer.endIndex {
             if buffer[index] == 0x0A {
                 let line = buffer[lineStart..<index]
-                if !line.isEmpty { lines.append(Data(line)) }
-                lastNewlineEnd = buffer.index(after: index)
-                lineStart = lastNewlineEnd
+                let startAbs = bufferBase + Int64(lineStart - buffer.startIndex)
+                let endAbs = bufferBase + Int64(index + 1 - buffer.startIndex)
+                if !line.isEmpty {
+                    if line.count > maxRecordBytes {
+                        oversizedComplete += 1
+                    } else {
+                        lines.append(Line(data: Data(line), startOffset: startAbs, endOffset: endAbs))
+                    }
+                }
+                lastNewlineEndIndex = buffer.index(after: index)
+                lastNewlineEndAbs = endAbs
+                lineStart = lastNewlineEndIndex!
             }
             index = buffer.index(after: index)
         }
 
-        var newCarry = Data(buffer[lastNewlineEnd..<buffer.endIndex])
-        var skipped = 0
-        if !newCarry.isEmpty, newCarry.count > maxRecordBytes {
-            newCarry = Data()
-            skipped = 1
+        let tailStart = lastNewlineEndIndex ?? buffer.startIndex
+        let tail = buffer[tailStart...]
+        var carryOut: Data
+        var carryStartOut: Int64
+        var committed: Int64
+        var oversizedPartial = false
+
+        if tail.count > maxRecordBytes {
+            // A partial record already exceeds the cap: drop it and advance the
+            // committed offset past the dropped bytes so a restart resumes after
+            // them rather than re-reading a huge prefix.
+            carryOut = Data()
+            carryStartOut = newReadPosition
+            committed = newReadPosition
+            oversizedPartial = true
+        } else {
+            carryOut = Data(tail)
+            if let lastNewlineEndAbs {
+                committed = lastNewlineEndAbs
+                carryStartOut = lastNewlineEndAbs
+            } else {
+                committed = carryStart
+                carryStartOut = carryStart
+            }
         }
 
         return Chunk(
-            lines: lines, readPosition: newReadPosition, carry: newCarry,
-            skippedOversized: skipped, bytesRead: data.count)
+            lines: lines, readPosition: newReadPosition, committedOffset: committed,
+            carry: carryOut, carryStart: carryStartOut, oversizedComplete: oversizedComplete,
+            oversizedPartial: oversizedPartial, bytesRead: data.count)
     }
 }

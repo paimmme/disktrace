@@ -1,0 +1,2 @@
+added /private/var/folders/mq/05gpv9cd22n7khjpp7j3s4980000gn/T/disktrace-e2e.AcWRpi/projectA/generated.bin
+added /private/var/folders/mq/05gpv9cd22n7khjpp7j3s4980000gn/T/disktrace-e2e.AcWRpi/Downloads/user-copy.bin

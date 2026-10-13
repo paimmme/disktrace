@@ -13,6 +13,14 @@ public enum CoverageGapCause: String, Codable, Sendable {
     case logRotation
     /// A session log record exceeded the per-record size cap and was skipped.
     case oversizedRecord
+    /// `session_meta` carried conflicting `id`/`session_id`, so linking is refused.
+    case schemaConflict
+    /// A task lifecycle event had no usable task/turn id.
+    case schemaMissingTaskID
+    /// A clock discontinuity was observed; window durations may be unreliable.
+    case clockDiscontinuity
+    /// A log line could not be parsed (malformed JSON); it was skipped safely.
+    case malformedRecord
 }
 
 public enum CoverageSeverity: String, Codable, Sendable, Comparable {

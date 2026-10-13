@@ -124,14 +124,15 @@ public final class ChangeMonitor: @unchecked Sendable {
         return Output(hints: hints, overflowed: wasOverflowed)
     }
 
-    fileprivate func ingest(eventID: UInt64, path: String, flag: ChangeFlag) {
+    fileprivate func ingest(eventID: UInt64, path: String, flag: ChangeFlag, rawFlags: UInt32) {
         lock.lock()
         defer { lock.unlock() }
         let observedAt = timeSource.now()
         if let existing = pending[path] {
             pending[path] = ChangeHint(
                 id: existing.id, eventID: eventID, path: path,
-                flag: merge(existing.flag, flag), observedAt: observedAt)
+                flag: merge(existing.flag, flag), rawFlags: existing.rawFlags | rawFlags,
+                observedAt: observedAt)
             return
         }
         if insertionOrder.count >= capacity {
@@ -140,7 +141,8 @@ public final class ChangeMonitor: @unchecked Sendable {
             overflowed = true
         }
         pending[path] = ChangeHint(
-            id: UUID(), eventID: eventID, path: path, flag: flag, observedAt: observedAt)
+            id: UUID(), eventID: eventID, path: path, flag: flag, rawFlags: rawFlags,
+            observedAt: observedAt)
         insertionOrder.append(path)
     }
 
@@ -164,7 +166,7 @@ public final class ChangeMonitor: @unchecked Sendable {
                 monitor.markOverflow()
                 continue
             }
-            monitor.ingest(eventID: eventID, path: path, flag: ChangeMonitor.map(flags))
+            monitor.ingest(eventID: eventID, path: path, flag: ChangeMonitor.map(flags), rawFlags: UInt32(truncatingIfNeeded: flags))
         }
     }
 

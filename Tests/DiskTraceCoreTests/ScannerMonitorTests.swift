@@ -103,7 +103,8 @@ struct MonitorCoordinatorTests {
         try await store.insert(
             AgentActivity(
                 sessionIDHash: "session-1", client: .codexCLI, startedAt: Date(),
-                endedAt: nil, workingDirectory: rootPath))
+                endedAt: Date().addingTimeInterval(60), workingDirectory: rootPath,
+                windowIsTaskBounded: true))
         try writeFile(root.appending(path: "growth-b.bin"), bytes: 200_000)
         let second = try await coordinator.runOnce()
         #expect(second.decisions.contains { $0.action == .notifyAgentAnomaly })

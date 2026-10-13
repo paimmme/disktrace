@@ -4,17 +4,17 @@
 
 It is **not** a "what is big right now" cleaner. It keeps a low-overhead history of volume free space, monitored-directory net change and bounded filesystem change clues, then attributes changes with explicit, explainable evidence. Expected user activity is recorded but stays silent by default.
 
-> Status: **Engineering Complete, Release Not Ready.** See [`docs/TECHNICAL_GATES.md`](docs/TECHNICAL_GATES.md) and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md). Nothing here claims a real signed/notarized install, a shippable process-level tracer, or a verified Codex client matrix.
+> Status: **Runnable prototype; core attribution incomplete; release not ready.** The local UI and capacity history run on a real Mac, but task attribution still has verified defects, file-level history and system notifications are missing. See [`docs/PRODUCT_STATUS.md`](docs/PRODUCT_STATUS.md), [`docs/TECHNICAL_GATES.md`](docs/TECHNICAL_GATES.md) and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md).
 
 ## What works today (verified)
 
 - **Single background Agent** (`disktrace-agent`) that samples volume capacity, watches changes with a bounded, coalescing FSEvents stream, periodically recalibrates directories, evaluates an alert policy and writes everything to one SQLite store.
 - **Separation of fact and inference**: `Observation` (volume samples, directory deltas, change hints), `Evidence` and `AlertDecision` are distinct, and a silent rule never deletes observation history.
 - **Agent-first alert filtering** as a pure function: time overlap alone can *never* become a confirmed agent alert; low disk space is a neutral, cause-agnostic safety alert.
-- **Codex read-only metadata integration** that is privacy-structural — it scans session logs for a whitelist of keys only and never materializes prompt, command or file content.
-- **Tiered retention** (detail → hourly → daily) with a soft quota that includes WAL/index overhead.
-- A read-only **SwiftUI app layer** (timeline, growth, health, settings).
-- **36 automated tests pass** (`swift test`), covering the policy matrix, storage/migration idempotence, retention, the privacy reader, the fixture scanner and a filesystem-backed end-to-end attribution test.
+- **Codex read-only metadata integration** that stores whitelisted metadata. Its structure-aware parser still needs real-client correctness and privacy hardening; see the current product status.
+- **Tiered retention** (detail → hourly → daily), per-table pruning and physical storage metrics including WAL/SHM. Quota pruning is based on in-use database pages; it is not a strict cap on all files.
+- A query-only **SwiftUI app layer** with Chinese navigation, space history, time filters, automatic refresh, directory changes, evidence details, Finder reveal and monitoring status.
+- **50 automated tests pass** (`swift test`), covering the policy matrix, storage/migration idempotence, retention, the privacy reader, scanner, read-only UI queries and synthetic end-to-end attribution. Passing these tests does not establish real-client attribution correctness; see the product status report.
 
 ## Explicitly out of scope / not verified
 
@@ -50,7 +50,7 @@ Requires **macOS 14+** and a **Swift 6.2** toolchain. Upstream Radix needs Xcode
 
 ```bash
 swift build          # builds DiskTraceCore, disktrace-agent, DiskTraceApp
-swift test           # 36 tests
+swift test           # 50 tests
 swift run disktrace-agent --once --db /tmp/dt.sqlite --root ~/Documents
 ```
 
@@ -69,6 +69,26 @@ The agent entry point accepts `--db <path>`, `--root <path>` (repeatable), `--ex
 | G7 install/upgrade | **BLOCKED** | Requires signing/notarization/Xcode. |
 
 Details and raw evidence: [`docs/TECHNICAL_GATES.md`](docs/TECHNICAL_GATES.md), [`docs/REUSE_AUDIT.md`](docs/REUSE_AUDIT.md), `artifacts/evidence/`.
+
+## 原始需求闭环（本轮实现）
+
+在原有卷级/目录监控之上，本轮补齐了「变化 → 具体文件 → 原因候选 → 提醒」的闭环：
+
+- **具体文件事实**：流式 `MetadataProbe`/`StreamingScanner` 建立有界的当前文件索引代次，代次差分产生
+  `file_changes`（added/grown/shrunk/removed/replaced/moved），前值未知写 NULL，绝不写 0 冒充（ADR-10）。
+- **真实 Codex 任务窗口**：`session_meta` / `event_msg.payload.type` 事件信封、`turn_id`、字节级白名单元数据
+  （正文不解码）、完整行游标 + 跨重启恢复 + 任务状态机 + 公平调度。
+- **可核验关联**：`EventAssembler` 按 (root, scope, 5 分钟桶) 聚合事件，`AttributionPolicy` 按验证状态/路径/时间
+  打候选；时间或目录重合不升级 `agentConfirmed`；未验证客户端不发 Agent 主动提醒。
+- **系统提醒链路**：持久 `notification_outbox`（幂等 ID）、冷却、quiet hours、到期；`UNUserNotificationCenter` sink
+  位于嵌入式 `DiskTraceAgentApp`（真实送达未验证）。
+- **中文只读 UI 闭环**：侧栏「空间概览 / 文件与事件 / 目录变化 / 监控状态」，事件 → 具体文件 → 任务候选 → Finder，
+  含 partial / detailExpired / permissionDenied / quotaLimited 视觉状态。
+- **自限**：有界 FSEvents 队列、库存行/字节预算、软/硬配额、低空间暂停新索引、WAL checkpoint 重试。
+
+验收分级（工程/本机/真实客户端/登录恢复/发布）与逐项证据见
+[`docs/ORIGINAL_NEED_ACCEPTANCE.md`](docs/ORIGINAL_NEED_ACCEPTANCE.md)；启停/配置/迁移/回退见
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md)。**真实客户端、系统通知、登录恢复、24 小时资源为 NOT RUN，发布未就绪。**
 
 ## Privacy
 

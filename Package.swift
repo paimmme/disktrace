@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .library(name: "DiskTraceCore", targets: ["DiskTraceCore"]),
         .executable(name: "disktrace-agent", targets: ["DiskTraceAgent"]),
+        .executable(name: "DiskTraceAgentApp", targets: ["DiskTraceAgentApp"]),
     ],
     targets: [
         .target(
@@ -25,7 +26,11 @@ let package = Package(
             dependencies: ["DiskTraceCore"],
             path: "Sources/DiskTraceApp"
         ),
-        .testTarget(
+        .executableTarget(
+            name: "DiskTraceAgentApp",
+            dependencies: ["DiskTraceCore"],
+            path: "Sources/DiskTraceAgentApp"
+        ),        .testTarget(
             name: "DiskTraceCoreTests",
             dependencies: ["DiskTraceCore"],
             path: "Tests/DiskTraceCoreTests"

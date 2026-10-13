@@ -56,5 +56,8 @@ chmod +x "$LD_SHIM/ld"
 
 export PATH="$LD_SHIM:$TC/usr/bin:$PATH"
 export SDKROOT="$SDK"
+# Without an active developer dir, xcrun cannot resolve "PlatformPath" under a
+# CLT-only install and `swift test` fails with "XCTest not available".
+export DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}"
 echo "Swift: $(swift --version | head -1)" >&2
 echo "SDK:   $SDKROOT" >&2

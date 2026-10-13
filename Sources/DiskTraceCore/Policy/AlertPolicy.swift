@@ -78,6 +78,40 @@ public enum AlertPolicy {
             )
         }
 
+        // User-facing storage events.
+        if case .event(let event) = observation {
+            let key = "event:\(event.scopePath)"
+            switch event.attributionClass {
+            case .agentProbable, .agentConfirmed:
+                let net = event.netBytes ?? 0
+                if net < config.agentGrowthThresholdBytes {
+                    return AlertDecision(
+                        ruleVersion: policyVersion, subjectID: event.id, action: .silent,
+                        reason: .belowThreshold, evidenceClass: .agentProbable, cooldownKey: key,
+                        evaluatedAt: now)
+                }
+                if let lastAlertAt, now.timeIntervalSince(lastAlertAt) < config.cooldown {
+                    return AlertDecision(
+                        ruleVersion: policyVersion, subjectID: event.id, action: .silent,
+                        reason: .cooldownActive, evidenceClass: .agentProbable, cooldownKey: key,
+                        evaluatedAt: now)
+                }
+                return AlertDecision(
+                    ruleVersion: policyVersion, subjectID: event.id, action: .notifyAgentAnomaly,
+                    reason: .agentProbableGrowth, evidenceClass: .agentProbable, cooldownKey: key,
+                    evaluatedAt: now)
+            case .userConfirmed:
+                return AlertDecision(
+                    ruleVersion: policyVersion, subjectID: event.id, action: .silent,
+                    reason: .userExpectedActivity, evidenceClass: .userConfirmed, evaluatedAt: now)
+            case .unknown:
+                return AlertDecision(
+                    ruleVersion: policyVersion, subjectID: event.id, action: .silent,
+                    reason: .unknownSource, evidenceClass: .unknown, cooldownKey: key,
+                    evaluatedAt: now)
+            }
+        }
+
         // Directory observations.
         if let suppressingRule {
             return AlertDecision(

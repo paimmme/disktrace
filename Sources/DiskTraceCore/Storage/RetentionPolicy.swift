@@ -15,11 +15,20 @@ public struct RetentionPolicy: Sendable {
     public var decisionsDays: Int
     public var activitiesDays: Int
     public var gapsDays: Int
+    /// Processed change hints.
+    public var hintsDays: Int
+    /// Raw file-change detail / event_files.
+    public var fileChangesDays: Int
+    /// User-facing storage events (aggregate kept longer than detail).
+    public var eventsDays: Int
+    public var presenceChecksDays: Int
     public var softQuotaBytes: Int64
     /// Upper bound on rows deleted in one pruning pass.
     public var maxRowsPerCycle: Int
     /// Allow `PRAGMA incremental_vacuum` (requires an incremental-auto-vacuum DB).
     public var incrementalVacuum: Bool
+    /// Free-space floor below which expensive inventory scans are suspended.
+    public var lowSpaceShedBytes: Int64
 
     public init(
         samplesDetailedDays: Int = 7,
@@ -29,9 +38,14 @@ public struct RetentionPolicy: Sendable {
         decisionsDays: Int = 90,
         activitiesDays: Int = 90,
         gapsDays: Int = 90,
-        softQuotaBytes: Int64 = 1_000_000_000,
+        hintsDays: Int = 2,
+        fileChangesDays: Int = 7,
+        eventsDays: Int = 90,
+        presenceChecksDays: Int = 7,
+        softQuotaBytes: Int64 = 384_000_000,
         maxRowsPerCycle: Int = 20_000,
-        incrementalVacuum: Bool = true
+        incrementalVacuum: Bool = true,
+        lowSpaceShedBytes: Int64 = 2_000_000_000
     ) {
         self.samplesDetailedDays = samplesDetailedDays
         self.samplesHourlyDays = samplesHourlyDays
@@ -40,9 +54,14 @@ public struct RetentionPolicy: Sendable {
         self.decisionsDays = decisionsDays
         self.activitiesDays = activitiesDays
         self.gapsDays = gapsDays
+        self.hintsDays = hintsDays
+        self.fileChangesDays = fileChangesDays
+        self.eventsDays = eventsDays
+        self.presenceChecksDays = presenceChecksDays
         self.softQuotaBytes = softQuotaBytes
         self.maxRowsPerCycle = maxRowsPerCycle
         self.incrementalVacuum = incrementalVacuum
+        self.lowSpaceShedBytes = lowSpaceShedBytes
     }
 }
 
@@ -86,6 +105,10 @@ public struct RetentionReport: Sendable, Equatable {
     public var activitiesDeleted = 0
     public var gapsDeleted = 0
     public var samplesDownsampled = 0
+    public var hintsDeleted = 0
+    public var fileChangesDeleted = 0
+    public var eventsDeleted = 0
+    public var eventsMarkedExpired = 0
     public var rowsDeletedForQuota = 0
     public var reclaimedBytes: Int64 = 0
     public var space = SpaceReport()

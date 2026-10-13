@@ -1,0 +1,10 @@
+{
+  "generatedAtUTC": "2026-10-13T13:20:42Z",
+  "os": "14.6",
+  "arch": "arm64",
+  "schemaVersion": "6",
+  "fixture": "/var/folders/mq/05gpv9cd22n7khjpp7j3s4980000gn/T//disktrace-e2e.AcWRpi",
+  "notificationTestRequested": 0,
+  "notificationTest": "NOT RUN",
+  "failures": 0
+}

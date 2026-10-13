@@ -6,12 +6,15 @@ import Foundation
 /// The agent is the only writer; the UI reads snapshots. Observations are
 /// append-only — decisions and rules never delete them.
 public actor DiskTraceStore {
-    private let database: SQLiteDatabase
+    let database: SQLiteDatabase
     private let databasePath: String?
 
-    public init(path: String) throws {
-        let database = try SQLiteDatabase(path: path)
-        try Migrations.migrate(database)
+    public init(path: String, readOnly: Bool = false) throws {
+        let database = try SQLiteDatabase(path: path, readOnly: readOnly)
+        if !readOnly {
+            try Migrations.assertWritable(database)
+            try Migrations.migrate(database)
+        }
         self.database = database
         self.databasePath = path == ":memory:" ? nil : path
     }
@@ -31,16 +34,33 @@ public actor DiskTraceStore {
 
     public func insert(_ sample: VolumeSample) throws {
         let statement = try database.prepare(
-            "INSERT OR REPLACE INTO volume_samples VALUES (?,?,?,?,?,?);")
+            """
+            INSERT OR REPLACE INTO volume_samples
+            (id, volume_id, observed_at, free_bytes, capacity_bytes, status)
+            VALUES (?,?,?,?,?,?);
+            """)
         try statement.run([
             .text(sample.id.uuidString), .text(sample.volumeID), .date(sample.observedAt),
             .int(sample.freeBytes), .int(sample.capacityBytes), .text(sample.status.rawValue),
         ])
     }
 
+    /// Inserts a sample and records which method produced its free-space value.
+    public func insert(_ sample: VolumeSample, method: VolumeMethod) throws {
+        try insert(sample)
+        let statement = try database.prepare(
+            "INSERT OR REPLACE INTO volume_measurement_context (sample_id, method) VALUES (?,?);")
+        try statement.run([.text(sample.id.uuidString), .text(method.rawValue)])
+    }
+
     public func insert(_ delta: DirectoryDelta) throws {
         let statement = try database.prepare(
-            "INSERT OR REPLACE INTO directory_changes VALUES (?,?,?,?,?,?,?,?,?);")
+            """
+            INSERT OR REPLACE INTO directory_changes
+            (id, path_id, window_start, window_end, delta_allocated_bytes,
+             before_allocated_bytes, after_allocated_bytes, checkpoint_id, calibration)
+            VALUES (?,?,?,?,?,?,?,?,?);
+            """)
         try statement.run([
             .text(delta.id.uuidString), .text(delta.pathID), .date(delta.windowStart),
             .date(delta.windowEnd), .int(delta.deltaAllocatedBytes),
@@ -51,7 +71,11 @@ public actor DiskTraceStore {
 
     public func insert(_ evidence: Evidence) throws {
         let statement = try database.prepare(
-            "INSERT OR REPLACE INTO evidence VALUES (?,?,?,?,?,?,?,?);")
+            """
+            INSERT OR REPLACE INTO evidence
+            (id, subject_id, source, scope, strength, identity, observed_at, limitation)
+            VALUES (?,?,?,?,?,?,?,?);
+            """)
         try statement.run([
             .text(evidence.id.uuidString), .text(evidence.subjectID.uuidString),
             .text(evidence.source.rawValue), .text(evidence.scope.rawValue),
@@ -62,7 +86,12 @@ public actor DiskTraceStore {
 
     public func insert(_ decision: AlertDecision) throws {
         let statement = try database.prepare(
-            "INSERT OR REPLACE INTO alert_decisions VALUES (?,?,?,?,?,?,?,?,?);")
+            """
+            INSERT OR REPLACE INTO alert_decisions
+            (id, rule_version, subject_id, action, reason, evidence_class,
+             evidence_ids, cooldown_key, evaluated_at)
+            VALUES (?,?,?,?,?,?,?,?,?);
+            """)
         let ids = (try? JSONEncoder().encode(decision.evidenceIDs.map(\.uuidString)))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
         try statement.run([
@@ -75,7 +104,11 @@ public actor DiskTraceStore {
 
     public func insert(_ gap: CoverageGap) throws {
         let statement = try database.prepare(
-            "INSERT OR REPLACE INTO coverage_gaps VALUES (?,?,?,?,?,?);")
+            """
+            INSERT OR REPLACE INTO coverage_gaps
+            (id, start_at, end_at, cause, affected_roots, severity)
+            VALUES (?,?,?,?,?,?);
+            """)
         let roots = (try? JSONEncoder().encode(gap.affectedRoots))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
         try statement.run([
@@ -86,7 +119,12 @@ public actor DiskTraceStore {
 
     public func insert(_ activity: AgentActivity) throws {
         let statement = try database.prepare(
-            "INSERT OR REPLACE INTO agent_activities VALUES (?,?,?,?,?,?,?,?);")
+            """
+            INSERT OR REPLACE INTO agent_activities
+            (id, session_id_hash, client, started_at, ended_at, working_directory,
+             task_id_hash, window_is_task_bounded)
+            VALUES (?,?,?,?,?,?,?,?);
+            """)
         try statement.run([
             .text(activity.id.uuidString), .text(activity.sessionIDHash),
             .text(activity.client.rawValue), .date(activity.startedAt),
@@ -98,7 +136,14 @@ public actor DiskTraceStore {
     // MARK: - Session sync (incremental, transactional)
 
     public func sessionSyncState(path: String) throws -> SessionSyncState? {
-        let statement = try database.prepare("SELECT * FROM session_sync WHERE file_path=?;")
+        let statement = try database.prepare(
+            """
+            SELECT file_path, file_identity, session_id_hash, byte_offset, file_size,
+                   modified_at, last_processed, working_directory, cursor_version,
+                   discarding_oversized, first_event_at, last_event_at, last_error,
+                   retry_after, last_scheduled_at
+            FROM session_sync WHERE file_path=?;
+            """)
         guard try statement.run([.text(path)]) else { return nil }
         return SessionSyncState(
             filePath: statement.text(0),
@@ -108,21 +153,36 @@ public actor DiskTraceStore {
             fileSize: statement.int64(4),
             modifiedAt: statement.optionalDate(5),
             lastProcessed: statement.date(6),
-            workingDirectory: statement.optionalText(7))
+            workingDirectory: statement.optionalText(7),
+            cursorVersion: statement.int(8),
+            discardingOversized: statement.int64(9) != 0,
+            firstEventAt: statement.optionalDate(10),
+            lastEventAt: statement.optionalDate(11),
+            lastError: statement.optionalText(12),
+            retryAfter: statement.optionalDate(13),
+            lastScheduledAt: statement.optionalDate(14))
     }
 
-    /// Commits activity upserts, sync-cursor updates and gap records in one
-    /// transaction, so a crash cannot advance a cursor past unrecorded activity.
-    public func applySync(
-        activities: [AgentActivity], states: [SessionSyncState], gaps: [CoverageGap] = []
+    /// Commits activity + task-window upserts, sync-cursor updates and gap
+    /// records in one transaction, so a crash cannot advance a cursor past
+    /// unrecorded activity or task state.
+    public func applySessionBatch(
+        activities: [AgentActivity],
+        taskWindows: [TaskWindow],
+        states: [SessionSyncState],
+        gaps: [CoverageGap]
     ) throws {
         try database.transaction {
             for activity in activities { try insert(activity) }
+            for window in taskWindows { try upsertTaskWindow(window) }
             let statement = try database.prepare(
                 """
                 INSERT OR REPLACE INTO session_sync
-                (file_path,file_identity,session_id_hash,byte_offset,file_size,modified_at,last_processed,working_directory)
-                VALUES (?,?,?,?,?,?,?,?);
+                (file_path, file_identity, session_id_hash, byte_offset, file_size,
+                 modified_at, last_processed, working_directory, cursor_version,
+                 discarding_oversized, first_event_at, last_event_at, last_error,
+                 retry_after, last_scheduled_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
                 """)
             for state in states {
                 statement.reset()
@@ -131,15 +191,159 @@ public actor DiskTraceStore {
                     .optionalText(state.sessionIDHash), .int(state.byteOffset),
                     .int(state.fileSize), .optionalDate(state.modifiedAt),
                     .date(state.lastProcessed), .optionalText(state.workingDirectory),
+                    .int(Int64(state.cursorVersion)),
+                    .int(state.discardingOversized ? 1 : 0),
+                    .optionalDate(state.firstEventAt), .optionalDate(state.lastEventAt),
+                    .optionalText(state.lastError), .optionalDate(state.retryAfter),
+                    .optionalDate(state.lastScheduledAt),
                 ])
             }
             for gap in gaps { try insert(gap) }
         }
     }
 
+    /// Convenience for callers that only have activities and cursors.
+    public func applySync(
+        activities: [AgentActivity], states: [SessionSyncState], gaps: [CoverageGap] = []
+    ) throws {
+        try applySessionBatch(activities: activities, taskWindows: [], states: states, gaps: gaps)
+    }
+
+    public func upsertTaskWindow(_ window: TaskWindow) throws {
+        let statement = try database.prepare(
+            """
+            INSERT OR REPLACE INTO task_windows
+            (activity_id, session_hash, task_hash, client_kind, client_version,
+             lifecycle_state, start_known, end_known, last_event_at, schema_kind,
+             verification_state, source_log_path, event_start_offset, event_end_offset)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+            """)
+        try statement.run([
+            .text(window.activityID.uuidString), .text(window.sessionHash),
+            .text(window.taskHash), .text(window.clientKind.rawValue),
+            .optionalText(window.clientVersion), .text(window.lifecycle.rawValue),
+            .int(window.startKnown ? 1 : 0), .int(window.endKnown ? 1 : 0),
+            .date(window.lastEventAt), .text(window.schemaKind),
+            .text(window.verification.rawValue), .text(window.sourceLogPath),
+            .optionalInt(window.eventStartOffset), .optionalInt(window.eventEndOffset),
+        ])
+    }
+
+    public func taskWindows(activeSince: Date) throws -> [TaskWindow] {
+        let statement = try database.prepare(
+            """
+            SELECT activity_id, session_hash, task_hash, client_kind, client_version,
+                   lifecycle_state, start_known, end_known, last_event_at, schema_kind,
+                   verification_state, source_log_path, event_start_offset, event_end_offset
+            FROM task_windows
+            WHERE lifecycle_state='running' OR last_event_at>=?
+            ORDER BY last_event_at DESC;
+            """)
+        try statement.bind([.date(activeSince)])
+        var result: [TaskWindow] = []
+        while try statement.step() { result.append(taskWindow(statement)) }
+        return result
+    }
+
+    public func latestTaskWindow(sessionHash: String) throws -> TaskWindow? {
+        let statement = try database.prepare(
+            """
+            SELECT activity_id, session_hash, task_hash, client_kind, client_version,
+                   lifecycle_state, start_known, end_known, last_event_at, schema_kind,
+                   verification_state, source_log_path, event_start_offset, event_end_offset
+            FROM task_windows WHERE session_hash=? ORDER BY last_event_at DESC LIMIT 1;
+            """)
+        guard try statement.run([.text(sessionHash)]) else { return nil }
+        return taskWindow(statement)
+    }
+
+    public func openTaskWindows(sessionHash: String) throws -> [TaskWindow] {
+        let statement = try database.prepare(
+            """
+            SELECT activity_id, session_hash, task_hash, client_kind, client_version,
+                   lifecycle_state, start_known, end_known, last_event_at, schema_kind,
+                   verification_state, source_log_path, event_start_offset, event_end_offset
+            FROM task_windows WHERE session_hash=? AND lifecycle_state='running'
+            ORDER BY last_event_at DESC;
+            """)
+        try statement.bind([.text(sessionHash)])
+        var result: [TaskWindow] = []
+        while try statement.step() { result.append(taskWindow(statement)) }
+        return result
+    }
+
+    public func taskWindow(activityID: UUID) throws -> TaskWindow? {
+        let statement = try database.prepare(
+            """
+            SELECT activity_id, session_hash, task_hash, client_kind, client_version,
+                   lifecycle_state, start_known, end_known, last_event_at, schema_kind,
+                   verification_state, source_log_path, event_start_offset, event_end_offset
+            FROM task_windows WHERE activity_id=?;
+            """)
+        guard try statement.run([.text(activityID.uuidString)]) else { return nil }
+        return taskWindow(statement)
+    }
+
+    public func saveClientVerification(_ verification: ClientVerification) throws {
+        let statement = try database.prepare(
+            """
+            INSERT OR REPLACE INTO client_verification
+            (client_kind, client_version, schema_kind, result, verified_at, evidence_reference)
+            VALUES (?,?,?,?,?,?);
+            """)
+        try statement.run([
+            .text(verification.clientKind.rawValue), .text(verification.clientVersion),
+            .text(verification.schemaKind), .text(verification.result.rawValue),
+            .optionalDate(verification.verifiedAt), .optionalText(verification.evidenceReference),
+        ])
+    }
+
+    public func clientVerification(
+        clientKind: AgentClientKind, clientVersion: String, schemaKind: String
+    ) throws -> ClientVerification? {
+        let statement = try database.prepare(
+            """
+            SELECT client_kind, client_version, schema_kind, result, verified_at, evidence_reference
+            FROM client_verification
+            WHERE client_kind=? AND client_version=? AND schema_kind=?;
+            """)
+        guard try statement.run([
+            .text(clientKind.rawValue), .text(clientVersion), .text(schemaKind),
+        ]) else { return nil }
+        return ClientVerification(
+            clientKind: AgentClientKind(rawValue: statement.text(0)) ?? .unknown,
+            clientVersion: statement.text(1),
+            schemaKind: statement.text(2),
+            result: VerificationState(rawValue: statement.text(3)) ?? .unverified,
+            verifiedAt: statement.optionalDate(4),
+            evidenceReference: statement.optionalText(5))
+    }
+
+    private func taskWindow(_ s: SQLiteStatement) -> TaskWindow {
+        TaskWindow(
+            activityID: UUID(uuidString: s.text(0)) ?? UUID(),
+            sessionHash: s.text(1),
+            taskHash: s.text(2),
+            clientKind: AgentClientKind(rawValue: s.text(3)) ?? .unknown,
+            clientVersion: s.optionalText(4),
+            lifecycle: TaskLifecycleState(rawValue: s.text(5)) ?? .unknownStart,
+            startKnown: s.int64(6) != 0,
+            endKnown: s.int64(7) != 0,
+            lastEventAt: s.date(8),
+            schemaKind: s.text(9),
+            verification: VerificationState(rawValue: s.text(10)) ?? .unverified,
+            sourceLogPath: s.text(11),
+            eventStartOffset: s.isNull(12) ? nil : s.int64(12),
+            eventEndOffset: s.isNull(13) ? nil : s.int64(13))
+    }
+
     public func save(_ rule: UserRule) throws {
         let statement = try database.prepare(
-            "INSERT OR REPLACE INTO user_rules VALUES (?,?,?,?,?,?,?);")
+            """
+            INSERT OR REPLACE INTO user_rules
+            (id, kind, path_pattern, created_at, expires_at, explanation, is_revoked)
+            VALUES (?,?,?,?,?,?,?);
+            """)
         try statement.run([
             .text(rule.id.uuidString), .text(rule.kind.rawValue), .text(rule.pathPattern),
             .date(rule.createdAt), .optionalDate(rule.expiresAt), .text(rule.explanation),
@@ -154,7 +358,7 @@ public actor DiskTraceStore {
 
     public func setState(_ key: String, _ value: String, at date: Date) throws {
         let statement = try database.prepare(
-            "INSERT OR REPLACE INTO monitor_state VALUES (?,?,?);")
+            "INSERT OR REPLACE INTO monitor_state (key, value, updated_at) VALUES (?,?,?);")
         try statement.run([.text(key), .text(value), .date(date)])
     }
 
@@ -223,6 +427,31 @@ public actor DiskTraceStore {
         var result: [AlertDecision] = []
         try statement.bind([.date(from), .date(to)])
         while try statement.step() { result.append(alertDecision(statement)) }
+        return result
+    }
+
+    public func decisions(from: Date, to: Date) throws -> [AlertDecision] {
+        let statement = try database.prepare(
+            "SELECT * FROM alert_decisions WHERE evaluated_at>=? AND evaluated_at<=? ORDER BY evaluated_at DESC;")
+        try statement.bind([.date(from), .date(to)])
+        var result: [AlertDecision] = []
+        while try statement.step() { result.append(alertDecision(statement)) }
+        return result
+    }
+
+    public func evidence(subjectID: UUID) throws -> [Evidence] {
+        let statement = try database.prepare("SELECT * FROM evidence WHERE subject_id=? ORDER BY observed_at DESC;")
+        try statement.bind([.text(subjectID.uuidString)])
+        var result: [Evidence] = []
+        while try statement.step() {
+            result.append(Evidence(
+                id: UUID(uuidString: statement.text(0)) ?? UUID(), subjectID: subjectID,
+                source: EvidenceSource(rawValue: statement.text(2)) ?? .directoryNameHint,
+                scope: EvidenceScope(rawValue: statement.text(3)) ?? .timeWindowOnly,
+                strength: EvidenceStrength(rawValue: statement.int(4)) ?? .weak,
+                identity: statement.optionalText(5), observedAt: statement.date(6),
+                limitation: statement.text(7)))
+        }
         return result
     }
 
@@ -298,6 +527,7 @@ public actor DiskTraceStore {
         for table in [
             "volume_samples", "directory_changes", "evidence", "alert_decisions",
             "coverage_gaps", "agent_activities", "user_rules", "session_sync",
+            "task_windows", "client_verification",
         ] {
             let statement = try database.prepare("SELECT COUNT(*) FROM \(table);")
             counts[table] = (try statement.step()) ? statement.int(0) : 0
@@ -399,6 +629,21 @@ public actor DiskTraceStore {
         report.gapsDeleted = try deleteCount(
             "DELETE FROM coverage_gaps WHERE end_at IS NOT NULL AND end_at < ?;",
             [cutoff(policy.gapsDays)])
+        // Processed change hints and old presence checks.
+        report.hintsDeleted = try deleteCount(
+            "DELETE FROM change_hints WHERE processing_state='processed' AND last_observed_at < ?;",
+            [cutoff(policy.hintsDays)])
+        _ = try deleteCount(
+            "DELETE FROM presence_checks WHERE checked_at IS NOT NULL AND checked_at < ?;",
+            [cutoff(policy.presenceChecksDays)])
+        // Mark events whose detail is about to be trimmed, then trim detail.
+        report.eventsMarkedExpired = try deleteCount(
+            "UPDATE storage_events SET status='detailExpired' WHERE window_end < ? AND status<>'detailExpired';",
+            [cutoff(policy.fileChangesDays)])
+        report.fileChangesDeleted = try deleteCount(
+            "DELETE FROM file_changes WHERE observed_at < ?;", [cutoff(policy.fileChangesDays)])
+        report.eventsDeleted = try deleteCount(
+            "DELETE FROM storage_events WHERE window_end < ?;", [cutoff(policy.eventsDays)])
 
         report.samplesDownsampled += try downsampleVolumeSamples(
             from: cutoffHourly, to: cutoffDetailed, seconds: 3_600)
@@ -434,6 +679,15 @@ public actor DiskTraceStore {
                 [])
             batch += try deleteCount(
                 "DELETE FROM evidence WHERE id IN (SELECT id FROM evidence ORDER BY observed_at ASC LIMIT 500);",
+                [])
+            batch += try deleteCount(
+                "DELETE FROM file_changes WHERE id IN (SELECT id FROM file_changes ORDER BY observed_at ASC LIMIT 500);",
+                [])
+            batch += try deleteCount(
+                "DELETE FROM change_hints WHERE id IN (SELECT id FROM change_hints ORDER BY last_observed_at ASC LIMIT 500);",
+                [])
+            batch += try deleteCount(
+                "DELETE FROM storage_events WHERE id IN (SELECT id FROM storage_events ORDER BY window_end ASC LIMIT 500);",
                 [])
             if batch == 0 { break }
             deleted += batch
