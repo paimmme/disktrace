@@ -149,7 +149,7 @@ public actor AgentActivitySync {
             }
 
             for line in chunk.lines {
-                let (acts, wins, lineGaps) = ingest(
+                let (acts, wins, lineGaps) = ingestLine(
                     line: line.data, startOffset: line.startOffset,
                     endOffset: line.endOffset, into: &runtime, path: item.path, now: now)
                 produced.append(contentsOf: acts)
@@ -209,7 +209,9 @@ public actor AgentActivitySync {
             return existing
         }
         guard let stored = try? await store.sessionSyncState(path: path) else {
-            return Runtime(readPosition: 0, carry: Data(), carryStart: 0, committedOffset: 0)
+            var fresh = Runtime(readPosition: 0, carry: Data(), carryStart: 0, committedOffset: 0)
+            bootstrapCursorRuntime(path: path, into: &fresh)
+            return fresh
         }
         if stored.fileIdentity != identity || size < stored.byteOffset {
             // Rotation or truncation: restart from 0; open tasks are interrupted.
@@ -240,6 +242,7 @@ public actor AgentActivitySync {
             runtime.committedOffset = repaired
             runtime.schemaKind = "legacy-repaired"
         }
+        bootstrapCursorRuntime(path: path, into: &runtime)
 
         // Recover client identity from an existing task window (session metadata
         // in the prefix is not re-read).
@@ -297,6 +300,106 @@ public actor AgentActivitySync {
     }
 
     // MARK: - Event ingestion
+
+    private func bootstrapCursorRuntime(path: String, into runtime: inout Runtime) {
+        guard CursorTranscriptParser.isCursorLogPath(path) else { return }
+        runtime.clientKind = .cursorAgent
+        runtime.schemaKind = "cursor-transcript"
+        runtime.verification = .unverified
+        if runtime.sessionHash == nil {
+            runtime.sessionHash = Self.hash(CursorTranscriptParser.sessionHash(fromLogPath: path))
+        }
+        if runtime.cwd == nil, let cwd = CursorTranscriptParser.workingDirectory(fromLogPath: path) {
+            runtime.cwd = configuration.hashWorkingDirectory ? Self.hash(cwd) : Self.normalize(cwd)
+        }
+    }
+
+    private func ingestLine(
+        line: Data, startOffset: Int64, endOffset: Int64, into runtime: inout Runtime,
+        path: String, now: Date
+    ) -> ([AgentActivity], [TaskWindow], [CoverageGap]) {
+        if CursorTranscriptParser.isCursorLogPath(path) {
+            return ingestCursor(
+                line: line, startOffset: startOffset, endOffset: endOffset, into: &runtime,
+                path: path, now: now)
+        }
+        return ingest(
+            line: line, startOffset: startOffset, endOffset: endOffset, into: &runtime,
+            path: path, now: now)
+    }
+
+    private func ingestCursor(
+        line: Data, startOffset: Int64, endOffset: Int64, into runtime: inout Runtime,
+        path: String, now: Date
+    ) -> ([AgentActivity], [TaskWindow], [CoverageGap]) {
+        bootstrapCursorRuntime(path: path, into: &runtime)
+        let parsed = CursorTranscriptParser.parse(line, now: now)
+        if let ts = parsed.timestamp {
+            if runtime.firstEventAt == nil { runtime.firstEventAt = ts }
+            runtime.lastEventAt = ts
+        }
+        let session = runtime.sessionHash ?? Self.hash(path)
+        let schemaKind = runtime.schemaKind
+        let eventTime = parsed.timestamp ?? now
+
+        switch parsed.kind {
+        case .ignored:
+            return ([], [], [])
+        case .userTurn:
+            let taskHash = Self.hash("\(session)|\(startOffset)")
+            if runtime.openTasks[taskHash] != nil { return ([], [], []) }
+            if runtime.openTasks.count >= 128 {
+                return (
+                    [], [],
+                    [
+                        CoverageGap(
+                            start: now, cause: .eventIDUnavailable, affectedRoots: [path],
+                            severity: .medium)
+                    ])
+            }
+            runtime.openTasks[taskHash] = OpenTask(
+                startedAt: eventTime, startOffset: startOffset, lifecycle: .running,
+                createdAt: now)
+            let activity = makeActivity(
+                session: session, client: .cursorAgent, cwd: runtime.cwd, taskHash: taskHash,
+                start: eventTime, end: nil, bounded: false)
+            let window = makeWindow(
+                activity: activity, session: session, clientVersion: runtime.clientVersion,
+                taskHash: taskHash, lifecycle: .running, startKnown: true, endKnown: false,
+                lastEventAt: eventTime, schemaKind: schemaKind, verification: runtime.verification,
+                path: path, startOffset: startOffset, endOffset: nil)
+            return ([activity], [window], [])
+        case .turnEnded(let status):
+            guard let (taskHash, open) = runtime.openTasks.first(where: { $0.value.lifecycle == .running })
+            else {
+                let taskHash = Self.hash("\(session)|end|\(endOffset)")
+                let activity = makeActivity(
+                    session: session, client: .cursorAgent, cwd: runtime.cwd, taskHash: taskHash,
+                    start: eventTime, end: eventTime, bounded: false)
+                let lifecycle: TaskLifecycleState = status == "error" ? .aborted : .unknownStart
+                let window = makeWindow(
+                    activity: activity, session: session, clientVersion: runtime.clientVersion,
+                    taskHash: taskHash, lifecycle: lifecycle, startKnown: false, endKnown: true,
+                    lastEventAt: eventTime, schemaKind: schemaKind,
+                    verification: runtime.verification, path: path, startOffset: nil,
+                    endOffset: endOffset)
+                return ([activity], [window], [])
+            }
+            runtime.openTasks.removeValue(forKey: taskHash)
+            let bounded = open.startedAt != nil && eventTime >= open.startedAt!
+            let lifecycle: TaskLifecycleState = status == "error" ? .aborted : .completed
+            let activity = makeActivity(
+                session: session, client: .cursorAgent, cwd: runtime.cwd, taskHash: taskHash,
+                start: open.startedAt, end: eventTime, bounded: bounded)
+            let window = makeWindow(
+                activity: activity, session: session, clientVersion: runtime.clientVersion,
+                taskHash: taskHash, lifecycle: lifecycle, startKnown: open.startedAt != nil,
+                endKnown: true, lastEventAt: eventTime, schemaKind: schemaKind,
+                verification: runtime.verification, path: path, startOffset: open.startOffset,
+                endOffset: endOffset)
+            return ([activity], [window], [])
+        }
+    }
 
     private func ingest(
         line: Data, startOffset: Int64, endOffset: Int64, into runtime: inout Runtime,
@@ -470,24 +573,31 @@ public actor AgentActivitySync {
             return
         }
         lastDiscovery = now
-        let fileManager = FileManager.default
-        let directory = configuration.sessionsDirectory
-        guard fileManager.fileExists(atPath: directory.path) else {
-            discovered = []
-            return
-        }
         let cutoff = now.addingTimeInterval(-Double(configuration.lookbackDays) * 86_400)
+        var found: [Discovered] = []
+        collectSessionLogs(
+            under: configuration.sessionsDirectory, cutoff: cutoff, into: &found,
+            limit: configuration.maxDiscoveredFiles)
+        if configuration.includeCursorProjects {
+            collectCursorTranscripts(
+                under: configuration.cursorProjectsRoot, cutoff: cutoff, into: &found,
+                limit: configuration.maxDiscoveredFiles)
+        }
+        discovered = found
+    }
+
+    private func collectSessionLogs(
+        under directory: URL, cutoff: Date, into found: inout [Discovered], limit: Int
+    ) {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: directory.path) else { return }
         let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
         guard
             let enumerator = fileManager.enumerator(
                 at: directory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
-        else {
-            discovered = []
-            return
-        }
-        var found: [Discovered] = []
+        else { return }
         for case let url as URL in enumerator {
-            guard found.count < configuration.maxDiscoveredFiles else { break }
+            guard found.count < limit else { break }
             guard url.pathExtension == "jsonl" else { continue }
             let values = try? url.resourceValues(forKeys: Set(keys))
             if values?.isRegularFile == false { continue }
@@ -496,7 +606,49 @@ public actor AgentActivitySync {
             found.append(
                 Discovered(url: url, path: FilePaths.canonical(url.path), modifiedAt: modified))
         }
-        discovered = found
+    }
+
+    /// Cursor nested layout: `agent-transcripts/<uuid>/<uuid>.jsonl` (flat variants skipped).
+    private func collectCursorTranscripts(
+        under directory: URL, cutoff: Date, into found: inout [Discovered], limit: Int
+    ) {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: directory.path) else { return }
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
+        guard
+            let projects = try? fileManager.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles])
+        else { return }
+        for projectURL in projects {
+            guard found.count < limit else { break }
+            if (try? projectURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true {
+                continue
+            }
+            let transcripts = projectURL.appending(path: "agent-transcripts", directoryHint: .isDirectory)
+            guard fileManager.fileExists(atPath: transcripts.path) else { continue }
+            guard
+                let sessionEnumerator = fileManager.enumerator(
+                    at: transcripts, includingPropertiesForKeys: keys,
+                    options: [.skipsHiddenFiles])
+            else { continue }
+            for case let entry as URL in sessionEnumerator {
+                guard found.count < limit else { break }
+                var isDir: ObjCBool = false
+                guard fileManager.fileExists(atPath: entry.path, isDirectory: &isDir), isDir.boolValue
+                else { continue }
+                let sessionID = entry.lastPathComponent
+                let main = entry.appending(path: "\(sessionID).jsonl")
+                guard fileManager.fileExists(atPath: main.path) else { continue }
+                let values = try? main.resourceValues(forKeys: Set(keys))
+                if values?.isRegularFile == false { continue }
+                let modified = values?.contentModificationDate ?? .distantPast
+                if modified < cutoff { continue }
+                found.append(
+                    Discovered(
+                        url: main, path: FilePaths.canonical(main.path), modifiedAt: modified))
+            }
+        }
     }
 
     private func attributes(of path: String) -> FileAttributes? {

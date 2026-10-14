@@ -54,7 +54,9 @@ swift test           # 50 tests
 swift run disktrace-agent --once --db /tmp/dt.sqlite --root ~/Documents
 ```
 
-The agent entry point accepts `--db <path>`, `--root <path>` (repeatable), `--exclude <path>` (repeatable), `--interval <seconds>` and `--once`.
+The agent entry point accepts `--db <path>`, `--root <path>` (repeatable), `--exclude <path>` (repeatable), `--interval <seconds>`, `--recommended-roots`, `--codex-home <path>`, `--hash-codex-paths` and `--once`.
+
+With `--recommended-roots` and no `--root`, the agent watches the home folder plus common coding-agent caches (Xcode DerivedData, `~/.npm`, `~/.cursor`, `~/.codex`, etc.) that exist on disk. Session sync reads **Codex** JSONL under `~/.codex/sessions` and **Cursor Agent** transcripts under `~/.cursor/projects/*/agent-transcripts/` (metadata only — no message bodies).
 
 ## Technical gates (summary)
 

@@ -12,7 +12,14 @@ struct DiskTraceAgentMain {
         }
         let support = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Application Support/DiskTrace")
         let database = options.databaseURL ?? support.appending(path: "disktrace.sqlite")
-        let roots = options.roots.isEmpty ? [FileManager.default.homeDirectoryForCurrentUser] : options.roots
+        let roots: [URL]
+        if options.roots.isEmpty {
+            roots = options.recommendedRoots
+                ? SuggestedMonitorRoots.codingAgentDefaults()
+                : [FileManager.default.homeDirectoryForCurrentUser]
+        } else {
+            roots = options.roots
+        }
         let task = Task {
             try await AgentRuntime.run(databaseURL: database,
                 config: MonitorConfig(roots: roots, exclusions: options.exclusions, sampleInterval: options.interval, calibrationInterval: options.calibration),
@@ -35,6 +42,7 @@ struct AgentOptions {
     var once = false
     var codexHome: URL?
     var hashCodexPaths = false
+    var recommendedRoots = false
 
     var resolvedCodexHome: URL {
         codexHome
@@ -68,6 +76,8 @@ struct AgentOptions {
                 if let value = next(), let seconds = TimeInterval(value) { options.calibration = seconds }
             case "--once":
                 options.once = true
+            case "--recommended-roots":
+                options.recommendedRoots = true
             default:
                 break
             }
