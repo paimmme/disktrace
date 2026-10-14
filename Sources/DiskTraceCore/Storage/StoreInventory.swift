@@ -447,13 +447,14 @@ extension DiskTraceStore {
         path: String, pathAfter: String, identityBefore: String?, identityAfter: String?,
         kind: FileChangeKind, before: Int64?, after: Int64?, beforeLogical: Int64?,
         afterLogical: Int64?, delta: Int64?, rootID: UUID, scanID: UUID, windowStart: Date,
-        windowEnd: Date, observedAt: Date, timing: TimingPrecision
+        windowEnd: Date, observedAt: Date, timing: TimingPrecision,
+        locator: String? = nil
     ) -> FileChange {
         FileChange(
             id: FileChange.stableID(
                 evidenceVersion: EvidenceVersion.current, rootID: rootID,
                 identityBefore: identityBefore, identityAfter: identityAfter, pathBefore: path,
-                pathAfter: pathAfter, locator: scanID.uuidString),
+                pathAfter: pathAfter, locator: locator ?? scanID.uuidString),
             rootID: rootID, scanID: scanID, pathBefore: path, pathAfter: pathAfter,
             identityBefore: identityBefore, identityAfter: identityAfter, kind: kind,
             windowStart: windowStart, windowEnd: windowEnd, observedAt: observedAt,
@@ -611,6 +612,21 @@ extension DiskTraceStore {
                     .date(hint.observedAt),
                 ])
             }
+            for hint in hints {
+                try rawExecute(
+                    """
+                    INSERT INTO pending_path_work
+                    (root_id, path, work_kind, first_dirty_at, last_dirty_at, next_attempt_at, attempt_count)
+                    VALUES (?, ?, 'probe', ?, ?, ?, 0)
+                    ON CONFLICT(root_id, path, work_kind) DO UPDATE SET
+                        last_dirty_at=excluded.last_dirty_at,
+                        next_attempt_at=MIN(pending_path_work.next_attempt_at, excluded.next_attempt_at);
+                    """,
+                    [
+                        .text(rootID.uuidString), .text(hint.path), .date(hint.observedAt),
+                        .date(hint.observedAt), .date(date),
+                    ])
+            }
             try rawExecute(
                 """
                 INSERT INTO event_checkpoints (volume_id, stream_kind, volume_identity, last_durable_event_id, updated_at)
@@ -621,6 +637,187 @@ extension DiskTraceStore {
                 [.text(volumeID), .text(volumeIdentity), .text(String(checkpoint)), .date(date)])
         }
         return hints.count
+    }
+
+    public struct PendingPathWork: Sendable {
+        public let rootID: UUID
+        public let path: String
+        public let firstDirtyAt: Date
+        public let lastDirtyAt: Date
+        public let attemptCount: Int
+    }
+
+    public func duePathWork(limit: Int, now: Date) throws -> [PendingPathWork] {
+        let statement = try database.prepare(
+            """
+            SELECT root_id, path, first_dirty_at, last_dirty_at, attempt_count
+            FROM pending_path_work
+            WHERE work_kind='probe' AND next_attempt_at<=?
+            ORDER BY last_dirty_at ASC LIMIT ?;
+            """)
+        try statement.bind([.date(now), .int(Int64(limit))])
+        var result: [PendingPathWork] = []
+        while try statement.step() {
+            guard let rootID = UUID(uuidString: statement.text(0)) else { continue }
+            result.append(
+                PendingPathWork(
+                    rootID: rootID, path: statement.text(1), firstDirtyAt: statement.date(2),
+                    lastDirtyAt: statement.date(3), attemptCount: statement.int(4)))
+        }
+        return result
+    }
+
+    public func finishPathWork(rootID: UUID, path: String) throws {
+        try rawExecute(
+            "DELETE FROM pending_path_work WHERE root_id=? AND path=? AND work_kind='probe';",
+            [.text(rootID.uuidString), .text(path)])
+        try rawExecute(
+            """
+            UPDATE change_hints SET processing_state='processed'
+            WHERE root_id=? AND path=? AND processing_state='pending';
+            """,
+            [.text(rootID.uuidString), .text(path)])
+    }
+
+    public func deferPathWork(rootID: UUID, path: String, attemptCount: Int, now: Date) throws {
+        let delay: TimeInterval
+        switch attemptCount {
+        case 0: delay = 5
+        case 1: delay = 30
+        default: delay = 300
+        }
+        try rawExecute(
+            """
+            UPDATE pending_path_work
+            SET attempt_count=attempt_count+1, next_attempt_at=?
+            WHERE root_id=? AND path=? AND work_kind='probe';
+            """,
+            [.date(now.addingTimeInterval(delay)), .text(rootID.uuidString), .text(path)])
+    }
+
+    /// Probes one path against the active inventory generation and records a
+    /// `liveHintWindow` file change when allocation differs.
+    public func applyLiveProbe(
+        rootID: UUID, metadata: FileMetadata, hintObservedAt: Date, now: Date
+    ) throws -> FileChange? {
+        guard let health = try rootHealth(rootID: rootID),
+            health.state == .ready, let scanID = health.activeScanID
+        else { return nil }
+
+        let statement = try database.prepare(
+            """
+            SELECT file_identity, allocated_bytes, logical_bytes, link_count
+            FROM file_inventory WHERE root_id=? AND scan_id=? AND path=?;
+            """)
+        try statement.bind([
+            .text(rootID.uuidString), .text(scanID.uuidString), .text(metadata.path),
+        ])
+        let hadRow = try statement.step()
+        let oldId = hadRow ? statement.optionalText(0) : nil
+        let oldAllocated = hadRow && !statement.isNull(1) ? statement.int64(1) : nil
+        let oldLogical = hadRow && !statement.isNull(2) ? statement.int64(2) : nil
+        let oldLink = hadRow && !statement.isNull(3) ? statement.int(3) : nil
+
+        try upsertInventoryRow(rootID: rootID, scanID: scanID, metadata: metadata)
+
+        let row = DiffRow(
+            path: metadata.path, oldId: oldId, newId: metadata.fileIdentity,
+            oldAllocated: oldAllocated, newAllocated: metadata.allocatedBytes,
+            oldLogical: oldLogical, newLogical: metadata.logicalBytes,
+            oldLink: oldLink, newLink: metadata.linkCount)
+
+        let windowStart = hintObservedAt
+        let locator = "live:\(metadata.path)|\(Int(hintObservedAt.timeIntervalSince1970))"
+        let change: FileChange?
+        if oldId == nil {
+            change = Self.change(
+                path: metadata.path, pathAfter: metadata.path, identityBefore: nil,
+                identityAfter: metadata.fileIdentity, kind: .added, before: nil,
+                after: metadata.allocatedBytes, beforeLogical: nil,
+                afterLogical: metadata.logicalBytes, delta: metadata.allocatedBytes,
+                rootID: rootID, scanID: scanID, windowStart: windowStart, windowEnd: now,
+                observedAt: now, timing: .liveHintWindow, locator: locator)
+        } else {
+            guard
+                var diff = Self.changedRow(
+                    row: row, rootID: rootID, scanID: scanID, windowStart: windowStart,
+                    windowEnd: now, observedAt: now, timing: .liveHintWindow)
+            else { return nil }
+            diff = FileChange(
+                id: FileChange.stableID(
+                    evidenceVersion: EvidenceVersion.current, rootID: rootID,
+                    identityBefore: diff.identityBefore, identityAfter: diff.identityAfter,
+                    pathBefore: diff.pathBefore, pathAfter: diff.pathAfter, locator: locator),
+                rootID: diff.rootID, scanID: diff.scanID, pathBefore: diff.pathBefore,
+                pathAfter: diff.pathAfter, identityBefore: diff.identityBefore,
+                identityAfter: diff.identityAfter, kind: diff.kind, windowStart: diff.windowStart,
+                windowEnd: diff.windowEnd, observedAt: diff.observedAt,
+                beforeLogical: diff.beforeLogical, afterLogical: diff.afterLogical,
+                beforeAllocated: diff.beforeAllocated, afterAllocated: diff.afterAllocated,
+                deltaAllocated: diff.deltaAllocated, measurement: diff.measurement,
+                timing: diff.timing, evidenceVersion: diff.evidenceVersion)
+            change = diff
+        }
+        if let change {
+            try insertFileChange(change)
+        }
+        return change
+    }
+
+    public func applyLiveRemoval(
+        rootID: UUID, path: String, hintObservedAt: Date, now: Date
+    ) throws -> FileChange? {
+        guard let health = try rootHealth(rootID: rootID),
+            health.state == .ready, let scanID = health.activeScanID
+        else { return nil }
+        let statement = try database.prepare(
+            """
+            SELECT file_identity, allocated_bytes, logical_bytes
+            FROM file_inventory WHERE root_id=? AND scan_id=? AND path=?;
+            """)
+        try statement.bind([
+            .text(rootID.uuidString), .text(scanID.uuidString), .text(path),
+        ])
+        guard try statement.step() else { return nil }
+        let oldId = statement.text(0)
+        let oldAllocated = statement.isNull(1) ? nil : statement.int64(1)
+        let oldLogical = statement.isNull(2) ? nil : statement.int64(2)
+        try rawExecute(
+            "DELETE FROM file_inventory WHERE root_id=? AND scan_id=? AND path=?;",
+            [.text(rootID.uuidString), .text(scanID.uuidString), .text(path)])
+        inventoryBudgetCache = nil
+        let locator = "live:\(path)|\(Int(hintObservedAt.timeIntervalSince1970))"
+        let change = Self.change(
+            path: path, pathAfter: path, identityBefore: oldId, identityAfter: nil,
+            kind: .removed, before: oldAllocated, after: nil, beforeLogical: oldLogical,
+            afterLogical: nil, delta: oldAllocated.map { -$0 }, rootID: rootID, scanID: scanID,
+            windowStart: hintObservedAt, windowEnd: now, observedAt: now,
+            timing: .liveHintWindow, locator: locator)
+        try insertFileChange(change)
+        return change
+    }
+
+    private func upsertInventoryRow(rootID: UUID, scanID: UUID, metadata: FileMetadata) throws {
+        try rawExecute(
+            """
+            INSERT INTO file_inventory
+            (root_id, scan_id, path, file_identity, kind, logical_bytes, allocated_bytes,
+             modified_at, birth_at, observed_at, link_count)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(root_id, scan_id, path) DO UPDATE SET
+                file_identity=excluded.file_identity, kind=excluded.kind,
+                logical_bytes=excluded.logical_bytes, allocated_bytes=excluded.allocated_bytes,
+                modified_at=excluded.modified_at, birth_at=excluded.birth_at,
+                observed_at=excluded.observed_at, link_count=excluded.link_count;
+            """,
+            [
+                .text(rootID.uuidString), .text(scanID.uuidString), .text(metadata.path),
+                .text(metadata.fileIdentity), .text(metadata.kind.rawValue),
+                .optionalInt(metadata.logicalBytes), .optionalInt(metadata.allocatedBytes),
+                .optionalDate(metadata.modifiedAt), .optionalDate(metadata.birthAt),
+                .date(metadata.observedAt), .int(Int64(metadata.linkCount)),
+            ])
+        inventoryBudgetCache = nil
     }
 
     public func pendingHintCount() throws -> Int {

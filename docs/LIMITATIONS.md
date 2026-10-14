@@ -59,11 +59,12 @@ Honest, current limits. None of these is hidden behind marketing language.
 - **Directory recalibration is periodic full-scan**, not event-driven subtree
   splicing (see G3).
 - **`claudeCode`** is modelled in the enum but has no adapter.
+- **`cursorAgent`** reads Cursor Agent JSONL transcripts (turn markers + encoded workspace path). Composer-only chats without `agent-transcripts` are not decoded; workspace path decoding is heuristic (`-` → `/`).
 
 ## 原始需求闭环（本轮新增）的已知限制
 
 - **真实客户端未验证**：Codex 事件信封与 `originator/source/cli_version` 来自本机白名单观察，不是稳定公共合同；未观察到的版本一律降级为 unknown，不猜兼容。`client_verification` 只有验收程序能写 `realClientVerified`。
-- **live hint 的逐路径探测**：FSEvents 线索已持久化（`change_hints` + `event_checkpoints` + overflow gap），但当前文件事实主要由**周期扫描的**代次差分产生；按线索的即时单路径探测是后续增强（`pending_path_work` 表已就位）。
+- **live hint 的逐路径探测**：FSEvents 线索写入 `change_hints` 与 `pending_path_work`；后台每轮最多探测 32 条路径并产出 `liveHintWindow` 文件变化（需已有有效扫描基线）。权限失败会退避重试；仍不能替代 15 分钟全量校准。
 - **目录校准为周期全量扫描**，不是事件驱动的子树拼接；正确但 I/O 更多。
 - **任务窗口的开放式/未结束**不会成为 `agentProbable` 的唯一证据；`agentConfirmed` 在本任务**永不产生**（无进程级能力）。
 - **presence checks** 为时钟驱动；真实 10 分钟/24 小时经过未运行。
