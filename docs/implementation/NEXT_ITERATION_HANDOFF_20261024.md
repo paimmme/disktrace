@@ -10,13 +10,12 @@
 
 ## 2. 项目位置、版本与接手入口
 
-- 本地源码：`/Users/wangjie/Documents/DiskTrace`。
+- 本地源码：克隆后的工作目录（示例 `~/Projects/DiskTrace`）。
 - GitHub：`https://github.com/paimmme/disktrace`。
-- 本轮开始前核实分支：`feat/original-need-closed-loop`；HEAD：`f936634ded47b8afcd37cad7b949b49233de505e`。工作区原本干净；本次只新增交接文档，未提交或推送。
-- 旧对话：[Review disktrace 项目](codex://threads/01a134e7-8bf5-71a3-bdc6-35fa2f57bf07)。旧对话最后确认上述提交已推送到功能分支，尚未合并 main；新的开发对话应重新核实 Git 状态，不假设远端未变。
-- 已安装 App：`/Users/wangjie/Applications/DiskTrace Local.app`，不是 `/Applications/DiskTrace.app`。
-- 真实历史库：`/Users/wangjie/Library/Application Support/DiskTrace/disktrace.sqlite`。运行中的数据库及 WAL 不可直接删除或覆盖。
-- 本机保留旧 App：`/Users/wangjie/Applications/DiskTrace Local.before-repair-20261013T223702Z.app`。备份可用性与旧库兼容性需另核实，不能直接让旧写者打开新库。
+- 接手前先核实当前分支与 `git log -1`；不假设远端与文档中的旧 HEAD 一致。
+- 本机 App（可选）：`~/Applications/DiskTrace Local.app`（由 `scripts/package-local.sh` / `scripts/deploy-interval-slice.sh` 生成）。
+- 真实历史库：`~/Library/Application Support/DiskTrace/disktrace.sqlite`。运行中的数据库及 WAL 不可直接删除或覆盖。
+- 旧版 App 备份应通过 `scripts/cleanup-local-residuals.sh` 清理，避免 Spotlight 误开旧包。
 
 先读以下文档：
 1. `docs/DiskTrace_PRD_v4.0.md`：产品目标与冻结边界。
@@ -56,7 +55,7 @@
 
 本对话实际删除：下载/更新缓存约 1.72 GiB、浏览器旧临时副本约 13.71 GiB、Adobe 相关软件和支持数据约 6.88 GiB。Data 卷 df 可用量从 7.83 GiB 增至 18.32 GiB，净增加 10.48 GiB。目录分配统计不能直接相加当作物理释放量，APFS 共享块和后台写入都会影响结果。Chrome 重启后又生成新临时副本，旧项删除与新项创建必须区分。
 
-证据保留在 `/Users/wangjie/Documents/Codex/2026-10-24/new-chat/outputs/`：`本次清理结果.md`、`清理执行清单.json`、`Adobe管理员清理结果.log`。不要默认把含本机路径的原始证据推送公开仓库；提炼脱敏 fixture 即可。
+本机验收证据应保留在开发者私有目录，**不要**把含用户名、绝对路径或清理清单的原始日志提交公开仓库；需要时在 `Tests/` 或 `docs/validation/` 使用脱敏 fixture。
 
 ## 5. 下一轮交付：时间段空间解释闭环
 

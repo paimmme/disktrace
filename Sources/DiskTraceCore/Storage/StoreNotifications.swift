@@ -20,6 +20,16 @@ extension DiskTraceStore {
         ])
     }
 
+    public func hasPendingNotification(category: NotificationCategory) throws -> Bool {
+        let statement = try database.prepare(
+            """
+            SELECT COUNT(*) FROM notification_outbox
+            WHERE category=? AND delivery_state IN ('pending','deferredQuietHours');
+            """)
+        guard try statement.run([.text(category.rawValue)]) else { return false }
+        return statement.int64(0) > 0
+    }
+
     public func notificationsToDeliver(now: Date, limit: Int = 50) throws -> [OutboxItem] {
         let statement = try database.prepare(
             """

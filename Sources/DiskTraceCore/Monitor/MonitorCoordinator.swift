@@ -80,7 +80,7 @@ public actor MonitorCoordinator {
         public var gaps: [CoverageGap] = []
     }
 
-    private let config: MonitorConfig
+    private var config: MonitorConfig
     private let store: DiskTraceStore
     private let scanner: ScannerBackend
     private let sampler: VolumeSampler
@@ -131,6 +131,34 @@ public actor MonitorCoordinator {
     }
 
     public var isRunning: Bool { running }
+    public var configRevision: Int { config.configRevision }
+
+    /// Hot-reload monitor roots after the UI updates `local-run.json`.
+    public func applyMonitorRoots(_ roots: [URL], configRevision: Int) async throws {
+        guard running else { return }
+        changeMonitor?.stop()
+        config.roots = roots
+        config.configRevision = configRevision
+        let monitor = ChangeMonitor(
+            roots: config.roots, capacity: config.changeCapacity, timeSource: timeSource)
+        do {
+            try monitor.start()
+        } catch {
+            let gap = CoverageGap(
+                start: timeSource.now(), cause: .permissionDenied,
+                affectedRoots: config.roots.map(\.path), severity: .medium)
+            openGaps.append(gap)
+            try? await store.insert(gap)
+        }
+        changeMonitor = monitor
+        lastCalibrationByRoot.removeAll()
+        let now = timeSource.now()
+        for root in config.roots {
+            _ = try await store.ensureRoot(
+                canonicalPath: FilePaths.canonical(root.path), volumeID: nil,
+                configRevision: configRevision, at: now)
+        }
+    }
 
     public func start() async throws {
         guard !running else { return }
@@ -334,19 +362,47 @@ public actor MonitorCoordinator {
             config: config.policy,
             now: now)
         try await store.insert(decision)
-        await enqueueIfNeeded(decision, now: now)
+        await updateLowSpaceNotificationEpisode(sample: sample, decision: decision, now: now)
+        await enqueueIfNeeded(decision, now: now, volumeID: sample.volumeID)
         return decision
+    }
+
+    /// Clears the low-space episode after consecutive healthy samples so the next
+    /// crunch can notify once again.
+    private func updateLowSpaceNotificationEpisode(
+        sample: VolumeSample, decision: AlertDecision, now: Date
+    ) async {
+        let key = "notify:lowSpaceSafety"
+        guard sample.status == .available else { return }
+        let isLow = decision.action == .notifySafetyLowSpace
+        if isLow { return }
+        guard let state = try? await store.policyState(key: key) else { return }
+        let recovered = state.recoveredSamples + 1
+        if recovered >= 2 {
+            try? await store.setPolicyState(
+                key: key, severity: NotificationCategory.lowSpaceSafety.rawValue,
+                lastSentAt: nil, recoveredSamples: 0, at: now)
+        } else {
+            try? await store.setPolicyState(
+                key: key, severity: NotificationCategory.lowSpaceSafety.rawValue,
+                lastSentAt: state.lastSentAt, recoveredSamples: recovered, at: now)
+        }
     }
 
     /// Writes a pending outbox item for a notifying decision. Delivery happens
     /// in the agent (independently of any UI window).
-    private func enqueueIfNeeded(_ decision: AlertDecision, now: Date) async {
+    private func enqueueIfNeeded(_ decision: AlertDecision, now: Date, volumeID: String = "") async {
         guard decision.notifies else { return }
         let category: NotificationCategory
         switch decision.action {
         case .notifyAgentAnomaly: category = .agentGrowth
         case .notifySafetyLowSpace: category = .lowSpaceSafety
         case .silent: return
+        }
+        if category == .lowSpaceSafety {
+            let key = "notify:lowSpaceSafety"
+            if let state = try? await store.policyState(key: key), state.lastSentAt != nil { return }
+            if (try? await store.hasPendingNotification(category: .lowSpaceSafety)) == true { return }
         }
         let item = OutboxItem(
             id: OutboxItem.stableID(decisionID: decision.id), decisionID: decision.id,

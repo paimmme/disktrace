@@ -49,6 +49,9 @@ final class AppModel: ObservableObject {
     @Published var hasMoreEvents = false
     @Published var hasMoreFiles = false
     @Published var intervalReport: IntervalExplanationReport?
+    @Published var rootSuggestions: [MonitorPresets.Suggestion] = []
+    /// Git commit recorded by the agent at startup (for verifying UI vs background).
+    @Published var agentBuildLabel: String?
     private var eventsTo = Date()
     private var store: DiskTraceStore?
     private var openedPath: String?
@@ -84,6 +87,44 @@ final class AppModel: ObservableObject {
             return GrowthSummary(path: path, netBytes: net, latest: latest, decision: decision, windows: rows.count)
         }.sorted { abs($0.netBytes) > abs($1.netBytes) }
     }
+    /// One-line summary for the directory growth page.
+    var growthHeadline: String {
+        let list = growth
+        guard let top = list.first else {
+            return "所选时段内监控目录还没有净变化；可换更长范围或在设置里扩大监控路径。"
+        }
+        let name = top.name
+        let dir = top.netBytes > 0 ? "占用增加" : "占用减少"
+        let extra = list.count > 1 ? "（共 \(list.count) 个目录有变化）" : ""
+        return "当前时段里变化最大的是「\(name)」\(dir) \(signedBytes(top.netBytes))\(extra)；右侧「来源未知」只表示尚无任务证据。"
+    }
+
+    /// One-line summary for the events page.
+    var eventsHeadline: String {
+        let measured = events.compactMap { event -> (StorageEvent, Int64)? in
+            guard let net = event.netBytes, net != 0 else { return nil }
+            return (event, net)
+        }
+        guard let top = measured.max(by: { abs($0.1) < abs($1.1) }) else {
+            return "这个时段还没有可量化的文件变化事件；可以换更长的时间范围。"
+        }
+        let name = URL(filePath: top.0.scopePath).lastPathComponent
+        let dir = top.1 > 0 ? "占用增加" : "占用减少"
+        return "最明显的一档在「\(name)」附近 \(dir) \(signedBytes(top.1))；任务关联仍是线索，不是写入证明。"
+    }
+
+    var overviewHeadline: String? {
+        if let report = intervalReport {
+            return IntervalVisualBuilder.build(report: report).headline
+        }
+        guard let latest = latestSample, samples.count >= 2 else { return nil }
+        let from = Date().addingTimeInterval(-range.seconds)
+        let inRange = samples.filter { $0.observedAt >= from }.sorted { $0.observedAt < $1.observedAt }
+        guard let first = inRange.first else { return nil }
+        let delta = latest.freeBytes - first.freeBytes
+        return "所选时段可用空间变化 \(signedBytes(delta))（当前剩余 \(bytes(latest.freeBytes))）；具体目录请看下方图表或「目录变化」。"
+    }
+
     var displayAlerts: [AlertDecision] {
         var seen = Set<String>()
         return decisions.filter { decision in
@@ -153,6 +194,9 @@ final class AppModel: ObservableObject {
             let changes = (try? await store.fileChanges(rootID: nil, from: from, to: now, limit: 5_000)) ?? []
             let buildCommit = try? await store.state("build_git_commit")
             let buildSchema = (try? await store.state("build_schema")).flatMap(Int.init)
+            if let buildCommit {
+                agentBuildLabel = buildSchema.map { "schema m\($0) · \(buildCommit)" } ?? buildCommit
+            }
             intervalReport = IntervalReportBuilder.build(
                 samples: volumeInRange, sampleMethods: methods, swapSamples: swap,
                 fileChanges: changes, gaps: loadedGaps, from: from, to: now,
@@ -220,6 +264,41 @@ final class AppModel: ObservableObject {
     }
 
     func confirmEvent(_ id: UUID) { Task { await sendControl(.confirmUser, eventID: id) } }
+
+    func refreshRootSuggestions() {
+        rootSuggestions = MonitorPresets.suggestedOptionalRoots()
+    }
+
+    func applyMonitorRoots(_ paths: [String]) async {
+        guard !controlPending else { return }
+        guard databasePath == Self.defaultDatabasePath() else {
+            controlMessage = "请使用本机默认数据库后再修改监控目录。"
+            return
+        }
+        controlPending = true
+        defer { controlPending = false }
+        let support = URL(filePath: databasePath).deletingLastPathComponent()
+        do {
+            _ = try LocalRunConfiguration.saveRoots(paths, support: support)
+        } catch {
+            controlMessage = "无法写入配置：\(error)"
+            return
+        }
+        let request = ControlRequest(command: .updateMonitorRoots, monitorRoots: paths)
+        do {
+            try ControlFiles.submit(request, support: support)
+            controlMessage = "等待后台应用监控目录…"
+            for _ in 0..<40 {
+                try await Task.sleep(for: .milliseconds(250))
+                if let receipt = ControlFiles.receipt(request.id, support: support) {
+                    controlMessage = receipt.detail
+                    await refresh()
+                    return
+                }
+            }
+            controlMessage = "后台尚未回执；请确认 Agent 正在运行。"
+        } catch { controlMessage = "请求未完成：\(error)" }
+    }
 
     func sendControl(_ command: ControlCommand, eventID: UUID? = nil) async {
         guard !controlPending else { return }

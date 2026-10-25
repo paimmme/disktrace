@@ -170,7 +170,6 @@ struct IntervalVisualPanel: View {
             title: "这段时间磁盘怎么了？",
             subtitle: "先看结论和分布，需要时再展开技术说明。"
         ) {
-            IntervalStoryHeader(summary: visual)
             HStack(spacing: 12) {
                 SummaryMetricTile(
                     icon: "internaldrive",
@@ -252,27 +251,53 @@ struct FileImpactBars: View {
 
 // MARK: - 目录增长 Top 图
 
+/// Top directories as spaced rows — avoids dense horizontal bar charts with long path labels.
 struct TopGrowthChart: View {
     let rows: [GrowthSummary]
-    private var chartRows: [(String, Double, Int64)] {
-        let top = rows.prefix(8)
-        let maxAbs = Double(top.map { abs($0.netBytes) }.max() ?? 1)
-        return top.map { (shortPath($0.path), Double($0.netBytes) / maxAbs, $0.netBytes) }
-    }
+    private var top: [GrowthSummary] { Array(rows.prefix(5)) }
+    private var maxAbs: Int64 { max(top.map { abs($0.netBytes) }.max() ?? 1, 1) }
+
     var body: some View {
-        if chartRows.isEmpty { EmptyView() } else {
-            Chart(Array(chartRows.enumerated()), id: \.offset) { _, row in
-                BarMark(x: .value("净变化", Double(row.2) / 1_000_000), y: .value("目录", row.0))
-                    .foregroundStyle(row.2 >= 0 ? Color.orange.gradient : Color.green.gradient)
-            }
-            .chartXAxis {
-                AxisMarks { value in
-                    AxisValueLabel {
-                        if let v = value.as(Double.self) { Text(String(format: "%.0f MB", v)) }
+        if top.isEmpty {
+            EmptyView()
+        } else {
+            VStack(alignment: .leading, spacing: 18) {
+                ForEach(top) { row in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
+                            Text(row.name)
+                                .font(.callout.weight(.semibold))
+                                .lineLimit(1)
+                            Spacer(minLength: 8)
+                            Text(signedBytes(row.netBytes))
+                                .font(.callout.weight(.medium).monospacedDigit())
+                                .foregroundStyle(row.netBytes > 0 ? Color(red: 0.78, green: 0.42, blue: 0.24) : Color(red: 0.12, green: 0.46, blue: 0.37))
+                        }
+                        Text(shortPath(row.path))
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        growthBar(fraction: CGFloat(abs(row.netBytes)) / CGFloat(maxAbs), growing: row.netBytes > 0)
                     }
+                    .padding(.vertical, 4)
                 }
             }
-            .frame(height: min(260, CGFloat(chartRows.count) * 32 + 24))
+            .padding(.vertical, 4)
         }
+    }
+
+    private func growthBar(fraction: CGFloat, growing: Bool) -> some View {
+        GeometryReader { geo in
+            let width = max(geo.size.width * min(1, fraction), fraction > 0 ? 6 : 0)
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color.primary.opacity(0.06))
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(growing ? Color(red: 0.78, green: 0.42, blue: 0.24).opacity(0.32) : Color(red: 0.12, green: 0.46, blue: 0.37).opacity(0.32))
+                    .frame(width: width)
+            }
+        }
+        .frame(height: 12)
     }
 }
