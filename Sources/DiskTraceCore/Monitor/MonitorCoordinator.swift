@@ -223,6 +223,14 @@ public actor MonitorCoordinator {
         if let output = changeMonitor?.drain() {
             report.changeCount = output.hints.count
             try await persistHints(output.hints, at: now)
+            if resourceMode() == .normal {
+                let probed = try await processLivePathProbes(now: now)
+                report.fileChangeCount += probed.count
+                if !probed.isEmpty {
+                    report.decisions.append(
+                        contentsOf: try await assembleAndEvaluate(changes: probed, now: now))
+                }
+            }
             if output.overflowed {
                 let gap = CoverageGap(
                     start: now, cause: .fseventsOverflow,
@@ -485,6 +493,39 @@ public actor MonitorCoordinator {
     }
 
     public func requestCalibration() { lastCalibrationByRoot.removeAll() }
+
+    private func processLivePathProbes(now: Date, limit: Int = 32) async throws -> [FileChange] {
+        let probe = MetadataProbe()
+        let work = (try? await store.duePathWork(limit: limit, now: now)) ?? []
+        guard !work.isEmpty else { return [] }
+        var emitted: [FileChange] = []
+        for item in work {
+            if paused || Task.isCancelled { break }
+            switch probe.probe(item.path, observedAt: now) {
+            case .success(let metadata):
+                if let change = try await store.applyLiveProbe(
+                    rootID: item.rootID, metadata: metadata, hintObservedAt: item.firstDirtyAt,
+                    now: now)
+                {
+                    emitted.append(change)
+                }
+                try? await store.finishPathWork(rootID: item.rootID, path: item.path)
+            case .failure(.notFound):
+                if let change = try await store.applyLiveRemoval(
+                    rootID: item.rootID, path: item.path, hintObservedAt: item.firstDirtyAt,
+                    now: now)
+                {
+                    emitted.append(change)
+                }
+                try? await store.finishPathWork(rootID: item.rootID, path: item.path)
+            case .failure:
+                try? await store.deferPathWork(
+                    rootID: item.rootID, path: item.path, attemptCount: item.attemptCount,
+                    now: now)
+            }
+        }
+        return emitted
+    }
 
     private func persistHints(_ hints: [ChangeHint], at now: Date) async throws {
         guard !hints.isEmpty else { return }
