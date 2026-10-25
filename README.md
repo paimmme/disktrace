@@ -60,6 +60,8 @@ swift run disktrace-agent --once --db /tmp/dt.sqlite --root "$HOME/Documents"
 open .build/debug/DiskTraceApp   # or package with scripts/package-local.sh
 ```
 
+The agent accepts `--db`, repeatable `--root` / `--exclude`, `--interval`, `--calibration`, `--once`, `--recommended-roots`, `--verify-codex-client`, `--codex-home`, and `--hash-codex-paths`. With no `--root`, it loads roots from `~/Library/Application Support/DiskTrace/local-run.json` when present; `--recommended-roots` instead picks common coding-agent cache paths that exist on disk. Session sync reads **Codex** JSONL and **Cursor Agent** transcript metadata only (no message bodies).
+
 ### Local install (optional)
 
 ```bash

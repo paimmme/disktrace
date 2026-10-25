@@ -59,7 +59,7 @@ extension DiskTraceStore {
         let statement = try database.prepare(
             """
             SELECT root_id, path, work_kind, first_dirty_at FROM pending_path_work
-            WHERE next_attempt_at <= ? ORDER BY last_dirty_at ASC LIMIT ?;
+            WHERE work_kind='probe' AND next_attempt_at <= ? ORDER BY last_dirty_at ASC LIMIT ?;
             """)
         try statement.bind([.date(now), .int(Int64(limit))])
         var result: [PathWorkItem] = []

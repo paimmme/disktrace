@@ -456,13 +456,14 @@ extension DiskTraceStore {
         path: String, pathAfter: String, identityBefore: String?, identityAfter: String?,
         kind: FileChangeKind, before: Int64?, after: Int64?, beforeLogical: Int64?,
         afterLogical: Int64?, delta: Int64?, rootID: UUID, scanID: UUID, windowStart: Date,
-        windowEnd: Date, observedAt: Date, timing: TimingPrecision
+        windowEnd: Date, observedAt: Date, timing: TimingPrecision,
+        locator: String? = nil
     ) -> FileChange {
         FileChange(
             id: FileChange.stableID(
                 evidenceVersion: EvidenceVersion.current, rootID: rootID,
                 identityBefore: identityBefore, identityAfter: identityAfter, pathBefore: path,
-                pathAfter: pathAfter, locator: scanID.uuidString),
+                pathAfter: pathAfter, locator: locator ?? scanID.uuidString),
             rootID: rootID, scanID: scanID, pathBefore: path, pathAfter: pathAfter,
             identityBefore: identityBefore, identityAfter: identityAfter, kind: kind,
             windowStart: windowStart, windowEnd: windowEnd, observedAt: observedAt,
@@ -620,6 +621,21 @@ extension DiskTraceStore {
                     .date(hint.observedAt),
                 ])
             }
+            for hint in hints {
+                try rawExecute(
+                    """
+                    INSERT INTO pending_path_work
+                    (root_id, path, work_kind, first_dirty_at, last_dirty_at, next_attempt_at, attempt_count)
+                    VALUES (?, ?, 'probe', ?, ?, ?, 0)
+                    ON CONFLICT(root_id, path, work_kind) DO UPDATE SET
+                        last_dirty_at=excluded.last_dirty_at,
+                        next_attempt_at=MIN(pending_path_work.next_attempt_at, excluded.next_attempt_at);
+                    """,
+                    [
+                        .text(rootID.uuidString), .text(hint.path), .date(hint.observedAt),
+                        .date(hint.observedAt), .date(date),
+                    ])
+            }
             try rawExecute(
                 """
                 INSERT INTO event_checkpoints (volume_id, stream_kind, volume_identity, last_durable_event_id, updated_at)
@@ -631,6 +647,29 @@ extension DiskTraceStore {
         }
         try enqueuePathWork(rootID: rootID, paths: hints.map(\.path), now: date)
         return hints.count
+    }
+
+    private func upsertInventoryRow(rootID: UUID, scanID: UUID, metadata: FileMetadata) throws {
+        try rawExecute(
+            """
+            INSERT INTO file_inventory
+            (root_id, scan_id, path, file_identity, kind, logical_bytes, allocated_bytes,
+             modified_at, birth_at, observed_at, link_count)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(root_id, scan_id, path) DO UPDATE SET
+                file_identity=excluded.file_identity, kind=excluded.kind,
+                logical_bytes=excluded.logical_bytes, allocated_bytes=excluded.allocated_bytes,
+                modified_at=excluded.modified_at, birth_at=excluded.birth_at,
+                observed_at=excluded.observed_at, link_count=excluded.link_count;
+            """,
+            [
+                .text(rootID.uuidString), .text(scanID.uuidString), .text(metadata.path),
+                .text(metadata.fileIdentity), .text(metadata.kind.rawValue),
+                .optionalInt(metadata.logicalBytes), .optionalInt(metadata.allocatedBytes),
+                .optionalDate(metadata.modifiedAt), .optionalDate(metadata.birthAt),
+                .date(metadata.observedAt), .int(Int64(metadata.linkCount)),
+            ])
+        inventoryBudgetCache = nil
     }
 
     public func pendingHintCount() throws -> Int {

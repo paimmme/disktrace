@@ -18,6 +18,10 @@ public struct CodexIntegrationConfiguration: Sendable {
     public var discoveryInterval: TimeInterval
     /// Hard cap on files held from one enumeration.
     public var maxDiscoveredFiles: Int
+    /// When true, also discover Cursor Agent JSONL transcripts under
+    /// `cursorProjectsRoot` (read-only metadata; no message bodies).
+    public var includeCursorProjects: Bool
+    public var cursorProjectsRoot: URL
 
     public init(
         codexHome: URL? = nil,
@@ -28,7 +32,9 @@ public struct CodexIntegrationConfiguration: Sendable {
         maxRecordBytes: Int = 512 * 1024,
         lookbackDays: Int = 7,
         discoveryInterval: TimeInterval = 30,
-        maxDiscoveredFiles: Int = 2000
+        maxDiscoveredFiles: Int = 2000,
+        includeCursorProjects: Bool = true,
+        cursorProjectsRoot: URL? = nil
     ) {
         self.codexHome =
             codexHome
@@ -42,6 +48,11 @@ public struct CodexIntegrationConfiguration: Sendable {
         self.lookbackDays = lookbackDays
         self.discoveryInterval = discoveryInterval
         self.maxDiscoveredFiles = maxDiscoveredFiles
+        self.includeCursorProjects = includeCursorProjects
+        self.cursorProjectsRoot =
+            cursorProjectsRoot
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appending(path: ".cursor/projects", directoryHint: .isDirectory)
     }
 
     public var sessionsDirectory: URL {

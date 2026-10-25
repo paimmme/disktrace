@@ -21,12 +21,18 @@ struct DiskTraceAgentMain {
             fputs("Invalid sampling/calibration interval\n", stderr)
             exit(2)
         }
-        let roots =
-            options.roots.isEmpty
-            ? AgentOptions.rootsFromSupport(support)
-            : options.roots
+        let roots: [URL]
+        if !options.roots.isEmpty {
+            roots = options.roots
+        } else if options.recommendedRoots {
+            roots = SuggestedMonitorRoots.codingAgentDefaults()
+        } else {
+            let fromSupport = AgentOptions.rootsFromSupport(support)
+            roots = fromSupport.isEmpty
+                ? [FileManager.default.homeDirectoryForCurrentUser] : fromSupport
+        }
         let config = MonitorConfig(
-            roots: roots.isEmpty ? [FileManager.default.homeDirectoryForCurrentUser] : roots,
+            roots: roots,
             exclusions: options.exclusions + [support.path],
             sampleInterval: options.interval, calibrationInterval: options.calibration)
         let task = Task {
@@ -85,6 +91,7 @@ struct AgentOptions {
     var codexHome: URL?
     var hashCodexPaths = false
     var verifyCodexClient = false
+    var recommendedRoots = false
 
     var resolvedCodexHome: URL {
         codexHome
@@ -132,6 +139,8 @@ struct AgentOptions {
                 options.once = true
             case "--verify-codex-client":
                 options.verifyCodexClient = true
+            case "--recommended-roots":
+                options.recommendedRoots = true
             default:
                 break
             }

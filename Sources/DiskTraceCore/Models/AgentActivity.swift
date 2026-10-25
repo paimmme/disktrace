@@ -6,6 +6,7 @@ public enum AgentClientKind: String, Codable, Sendable {
     case codexIDE
     case codexDesktop
     case claudeCode
+    case cursorAgent
     case unknown
 }
 
