@@ -65,8 +65,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>DiskTrace</string>
   <key>CFBundleExecutable</key><string>DiskTraceApp</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.1</string>
-  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>0.2.2</string>
+  <key>CFBundleVersion</key><string>3</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>CFBundleURLTypes</key><array><dict>
     <key>CFBundleURLName</key><string>local.disktrace.event</string>
@@ -83,8 +83,8 @@ cat > "$AGENT_APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>DiskTraceAgent</string>
   <key>CFBundleExecutable</key><string>DiskTraceAgent</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.1</string>
-  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>0.2.2</string>
+  <key>CFBundleVersion</key><string>3</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
 </dict></plist>

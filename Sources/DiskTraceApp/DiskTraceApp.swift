@@ -156,6 +156,9 @@ private struct OverviewView: View {
             SectionPanel(title: "可用空间趋势", subtitle: "曲线下降表示剩余空间减少；这是整个卷的变化。") {
                 SpaceChart(samples: model.samples)
             }
+            if let report = model.intervalReport {
+                IntervalVisualPanel(report: report)
+            }
             HStack(alignment: .top, spacing: 24) {
                 VStack(alignment: .leading, spacing: 14) {
                     Text("近期提醒").font(.headline)
@@ -277,7 +280,12 @@ private struct GrowthView: View {
                     Text("全部变化").tag(0); Text("空间增加占用").tag(1); Text("空间释放").tag(2)
                 }.frame(width: 185)
             }
-            Text("显示所选时段的目录净变化。父目录包含子目录，数值不可直接相加；正数表示占用增加。")
+            if !rows.isEmpty {
+                SectionPanel(title: "增长最多的目录", subtitle: "横向长度表示净变化大小；点击列表可看详情。") {
+                    TopGrowthChart(rows: rows)
+                }
+            }
+            Text("下方列表可搜索路径。父目录包含子目录，不要直接把数字相加。")
                 .font(.callout).foregroundStyle(.secondary)
             if rows.isEmpty {
                 EmptyState(icon: "folder.badge.questionmark", title: search.isEmpty ? "尚无匹配的目录变化" : "没有匹配的目录",
@@ -417,7 +425,11 @@ private struct HealthView: View {
                         HStack {
                             Label(shortPath(path), systemImage: "folder").textSelection(.enabled)
                             Spacer()
-                            Text(model.paused ? "已暂停" : (model.rootStates[path]?.state.readable ?? "等待记录"))
+                            Text(
+                                model.paused
+                                    ? "已暂停"
+                                    : (model.rootStates[path]?.state.readable(
+                                        limitation: model.rootStates[path]?.limitationKind) ?? "等待记录"))
                                 .font(.caption).foregroundStyle(.secondary)
                             Button("Finder") { model.reveal(path) }.buttonStyle(.borderless)
                         }
@@ -481,22 +493,6 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }.formStyle(.grouped).padding().frame(width: 680, height: 640)
-    }
-}
-
-private struct SectionPanel<Content: View>: View {
-    let title: String
-    let subtitle: String
-    @ViewBuilder var content: Content
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(title).font(.headline)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
-            }
-            content
-        }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
-            .background(Palette.surface).clipShape(RoundedRectangle(cornerRadius: 12))
     }
 }
 

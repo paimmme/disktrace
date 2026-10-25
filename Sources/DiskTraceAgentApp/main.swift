@@ -101,9 +101,12 @@ final class AgentAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificatio
             at: support, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
         let dbURL = support.appending(path: "disktrace.sqlite")
+        let codexHome = FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".codex", directoryHint: .isDirectory)
         do {
-            try await AgentRuntime.run(databaseURL: dbURL,
-                config: configuration(from: support),
+            try await AgentRuntime.run(
+                databaseURL: dbURL, config: configuration(from: support),
+                codex: CodexIntegrationConfiguration(codexHome: codexHome),
                 dispatcher: NotificationDispatcher(config: NotificationConfig(), sink: SystemNotificationSink()),
                 nativeCommand: { command in
                     let center = UNUserNotificationCenter.current()

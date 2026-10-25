@@ -57,8 +57,8 @@ scripts/package-local.sh --output "build/DiskTrace Local.app" --configuration re
 
 ## 数据库迁移
 
-- 当前 schema 版本：**v6**（v1 观察表 → v2 任务/游标 → v3 工作目录 → v4 任务窗口/完整行游标 →
-  v5 范围/线索/文件索引 → v6 事件/关联/通知）。
+- 当前 schema 版本：**v7**（v6 事件/关联/通知 → v7 双口径卷采样、swap 样本、`limitation_kind`）。
+- 历史 v6 见上一版说明（v1–v6 链不变）。
 - 每个版本一个事务；`PRAGMA foreign_keys=ON`。写者拒绝比自身更新的 schema（不迁移未来版本）。
 - 升级前建议用 SQLite [Online Backup API](https://sqlite.org/backup.html) 生成一致性备份
   （含已提交 WAL），不要复制正在写入的单个 `.sqlite` 文件。

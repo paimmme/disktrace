@@ -56,45 +56,54 @@ extension DiskTraceStore {
 
     /// Updates only the health state, preserving the active generation and the
     /// last success time (used by the low-space state machine).
-    public func markRootState(rootID: UUID, state: RootState, coverage: String? = nil) throws {
+    public func markRootState(
+        rootID: UUID, state: RootState, coverage: String? = nil,
+        limitationKind: RootLimitationKind? = nil
+    ) throws {
         try rawExecute(
             """
-            INSERT INTO root_health (root_id, state, inventory_coverage) VALUES (?, ?, ?)
+            INSERT INTO root_health (root_id, state, inventory_coverage, limitation_kind) VALUES (?, ?, ?, ?)
             ON CONFLICT(root_id) DO UPDATE SET state=excluded.state,
-                inventory_coverage=COALESCE(excluded.inventory_coverage, root_health.inventory_coverage);
+                inventory_coverage=COALESCE(excluded.inventory_coverage, root_health.inventory_coverage),
+                limitation_kind=COALESCE(excluded.limitation_kind, root_health.limitation_kind);
             """,
-            [.text(rootID.uuidString), .text(state.rawValue), .text(coverage ?? "pending")])
+            [
+                .text(rootID.uuidString), .text(state.rawValue), .text(coverage ?? "pending"),
+                .optionalText(limitationKind?.rawValue),
+            ])
     }
 
     public func rootHealth(rootID: UUID) throws -> RootHealth? {
         let statement = try database.prepare("SELECT * FROM root_health WHERE root_id=?;")
         guard try statement.run([.text(rootID.uuidString)]) else { return nil }
+        let limitation = statement.optionalText(7).flatMap(RootLimitationKind.init(rawValue:))
         return RootHealth(
             rootID: rootID,
             activeScanID: statement.optionalText(1).flatMap(UUID.init(uuidString:)),
             state: RootState(rawValue: statement.text(2)) ?? .pending,
             lastSuccessAt: statement.optionalDate(3),
             nextRetryAt: statement.optionalDate(4),
-            inventoryCoverage: statement.text(6))
+            inventoryCoverage: statement.text(6), limitationKind: limitation)
     }
 
     public func setRootHealth(
         rootID: UUID, state: RootState, activeScanID: UUID?, lastSuccessAt: Date?,
-        nextRetryAt: Date?, coverage: String
+        nextRetryAt: Date?, coverage: String, limitationKind: RootLimitationKind? = nil
     ) throws {
         let statement = try database.prepare(
             """
             INSERT INTO root_health
-            (root_id, active_scan_id, state, last_success_at, next_retry_at, inventory_coverage)
-            VALUES (?,?,?,?,?,?)
+            (root_id, active_scan_id, state, last_success_at, next_retry_at, inventory_coverage, limitation_kind)
+            VALUES (?,?,?,?,?,?,?)
             ON CONFLICT(root_id) DO UPDATE SET active_scan_id=excluded.active_scan_id,
                 state=excluded.state, last_success_at=COALESCE(excluded.last_success_at, root_health.last_success_at),
-                next_retry_at=excluded.next_retry_at, inventory_coverage=excluded.inventory_coverage;
+                next_retry_at=excluded.next_retry_at, inventory_coverage=excluded.inventory_coverage,
+                limitation_kind=COALESCE(excluded.limitation_kind, root_health.limitation_kind);
             """)
         try statement.run([
             .text(rootID.uuidString), .optionalText(activeScanID?.uuidString),
             .text(state.rawValue), .optionalDate(lastSuccessAt), .optionalDate(nextRetryAt),
-            .text(coverage),
+            .text(coverage), .optionalText(limitationKind?.rawValue),
         ])
     }
 
@@ -544,7 +553,7 @@ extension DiskTraceStore {
         return result
     }
 
-    func insertFileChange(_ change: FileChange) throws {
+    public func insertFileChange(_ change: FileChange) throws {
         let statement = try database.prepare(
             """
             INSERT OR REPLACE INTO file_changes
@@ -620,6 +629,7 @@ extension DiskTraceStore {
                 """,
                 [.text(volumeID), .text(volumeIdentity), .text(String(checkpoint)), .date(date)])
         }
+        try enqueuePathWork(rootID: rootID, paths: hints.map(\.path), now: date)
         return hints.count
     }
 

@@ -1,3 +1,4 @@
+import Charts
 import DiskTraceCore
 import SwiftUI
 
@@ -33,7 +34,11 @@ struct EventsView: View {
     }
 
     private var eventList: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 16) {
+            if events.count >= 2 {
+                EventTimelineChart(events: events)
+            }
+            VStack(spacing: 0) {
             ForEach(events) { event in
                 Button {
                     Task { await model.selectEvent(event.id) }
@@ -43,7 +48,39 @@ struct EventsView: View {
                 .buttonStyle(.plain)
                 Divider()
             }
+            }
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
         }
+    }
+}
+
+/// 事件净变化时间分布（仅展示有数字的事件，未知不画成 0）。
+private struct EventTimelineChart: View {
+    let events: [StorageEvent]
+    private var points: [StorageEvent] {
+        events.filter { $0.netBytes != nil }.prefix(40).sorted { $0.windowEnd < $1.windowEnd }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("事件时间分布").font(.headline)
+            Text("柱越高表示该时间窗内占用增加越多（有测量值的事件）。")
+                .font(.caption).foregroundStyle(.secondary)
+            if points.isEmpty {
+                Text("当前事件缺少可绘制的净变化数值。").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Chart(points) { event in
+                    BarMark(
+                        x: .value("时间", event.windowEnd),
+                        y: .value("净变化 MB", Double(event.netBytes ?? 0) / 1_000_000)
+                    )
+                    .foregroundStyle((event.netBytes ?? 0) >= 0 ? Color.orange.gradient : Color.green.gradient)
+                }
+                .chartYAxis { AxisMarks(position: .leading) }
+                .frame(height: 160)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
     }
 }
@@ -91,6 +128,7 @@ private struct EventDetail: View {
             if model.eventFiles.isEmpty {
                 Text("没有保留的文件明细（可能已过保留期）。").font(.callout).foregroundStyle(.secondary)
             } else {
+                FileImpactBars(files: model.eventFiles)
                 fileTable
             }
             if !model.eventLinks.isEmpty {

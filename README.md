@@ -14,7 +14,7 @@ It is **not** a "what is big right now" cleaner. It keeps a low-overhead history
 - **Codex read-only metadata integration** that stores whitelisted metadata. Its structure-aware parser still needs real-client correctness and privacy hardening; see the current product status.
 - **Tiered retention** (detail → hourly → daily), per-table pruning and physical storage metrics including WAL/SHM. Quota pruning is based on in-use database pages; it is not a strict cap on all files.
 - A query-only **SwiftUI app layer** with Chinese navigation, space history, time filters, automatic refresh, directory changes, evidence details, Finder reveal and monitoring status.
-- **50 automated tests pass** (`swift test`), covering the policy matrix, storage/migration idempotence, retention, the privacy reader, scanner, read-only UI queries and synthetic end-to-end attribution. Passing these tests does not establish real-client attribution correctness; see the product status report.
+- **116 automated tests pass** (`swift test`, 2026-10-24 slice), covering the policy matrix, storage/migration idempotence, retention, path-hint diff, interval reports, the privacy reader, scanner, read-only UI queries and synthetic end-to-end attribution. Passing these tests does not establish real-client attribution correctness; see the product status report.
 
 ## Explicitly out of scope / not verified
 
@@ -50,7 +50,7 @@ Requires **macOS 14+** and a **Swift 6.2** toolchain. Upstream Radix needs Xcode
 
 ```bash
 swift build          # builds DiskTraceCore, disktrace-agent, DiskTraceApp
-swift test           # 50 tests
+swift test           # 116 tests (Swift 6.2 — see scripts/toolchain-env.sh)
 swift run disktrace-agent --once --db /tmp/dt.sqlite --root ~/Documents
 ```
 

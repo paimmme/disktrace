@@ -48,6 +48,7 @@ final class AppModel: ObservableObject {
     @Published var heartbeat: Date?
     @Published var hasMoreEvents = false
     @Published var hasMoreFiles = false
+    @Published var intervalReport: IntervalExplanationReport?
     private var eventsTo = Date()
     private var store: DiskTraceStore?
     private var openedPath: String?
@@ -146,6 +147,16 @@ final class AppModel: ObservableObject {
             refreshedAt = now
             errorMessage = nil
             await loadEvents(from: from, to: now)
+            let volumeInRange = samples
+            let methods = (try? await store.volumeMethods(for: recent.filter { $0.observedAt >= from })) ?? [:]
+            let swap = (try? await store.swapSamples(from: from, to: now)) ?? []
+            let changes = (try? await store.fileChanges(rootID: nil, from: from, to: now, limit: 5_000)) ?? []
+            let buildCommit = try? await store.state("build_git_commit")
+            let buildSchema = (try? await store.state("build_schema")).flatMap(Int.init)
+            intervalReport = IntervalReportBuilder.build(
+                samples: volumeInRange, sampleMethods: methods, swapSamples: swap,
+                fileChanges: changes, gaps: loadedGaps, from: from, to: now,
+                buildGitCommit: buildCommit, buildSchema: buildSchema)
         } catch {
             errorMessage = "无法读取最新数据，当前画面可能已过期：\(error)"
         }
@@ -313,16 +324,19 @@ extension CoverageGapCause {
 }
 
 extension RootState {
-    var readable: String {
+    func readable(limitation: RootLimitationKind?) -> String {
+        if let limitation { return limitation.displayName }
         switch self {
         case .pending: return "等待初始扫描"
         case .scanning: return "扫描中"
         case .ready: return "基线有效"
         case .needsRebaseline: return "需要重新建立基线"
         case .permissionDenied: return "读取权限不足"
-        case .quotaLimited: return "库存预算或低空间限制"
+        case .quotaLimited: return "扫描受限（原因未记录）"
         case .paused: return "已暂停"
         case .unavailable: return "扫描不可用"
         }
     }
+
+    var readable: String { readable(limitation: nil) }
 }

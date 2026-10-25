@@ -14,6 +14,8 @@ public enum AgentRuntime {
         defer { lease.release() }
         let store = try DiskTraceStore(path: databaseURL.path)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: databaseURL.path)
+        await BuildIdentity.record(
+            store: store, gitCommit: BuildIdentity.resolveGitCommit(), appVersion: nil)
         let coordinator = MonitorCoordinator(config: config, store: store, activitySync: AgentActivitySync(configuration: codex))
         if once {
             try await coordinator.start()

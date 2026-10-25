@@ -84,9 +84,11 @@ public actor MonitorCoordinator {
     private let store: DiskTraceStore
     private let scanner: ScannerBackend
     private let sampler: VolumeSampler
+    private let swapSampler: SwapSampler
     private let timeSource: TimeSource
     private let scannerName: String
     private let activitySync: AgentActivitySync?
+    private let pathProbe = MetadataProbe()
 
     private var changeMonitor: ChangeMonitor?
     private var lastCalibrationByRoot: [String: Date] = [:]
@@ -113,6 +115,7 @@ public actor MonitorCoordinator {
         store: DiskTraceStore,
         scanner: ScannerBackend = FixtureScanner(),
         sampler: VolumeSampler = VolumeSampler(),
+        swapSampler: SwapSampler = SwapSampler(),
         timeSource: TimeSource = SystemTimeSource(),
         scannerName: String = "fixture",
         activitySync: AgentActivitySync? = nil
@@ -121,6 +124,7 @@ public actor MonitorCoordinator {
         self.store = store
         self.scanner = scanner
         self.sampler = sampler
+        self.swapSampler = swapSampler
         self.timeSource = timeSource
         self.scannerName = scannerName
         self.activitySync = activitySync
@@ -159,7 +163,8 @@ public actor MonitorCoordinator {
             if paused { break }
             if resourceMode() != .normal {
                 let record = try await store.ensureRoot(canonicalPath: FilePaths.canonical(root.path), volumeID: nil, configRevision: config.configRevision, at: timeSource.now())
-                try await store.markRootState(rootID: record.id, state: .quotaLimited)
+                try await store.markRootState(
+                    rootID: record.id, state: .quotaLimited, limitationKind: .lowSpace)
                 continue
             }
             let rootID = MonitoredRoot.stableID(canonicalPath: FilePaths.canonical(root.path))
@@ -211,10 +216,12 @@ public actor MonitorCoordinator {
 
         // 1. Volume sampling (never blocked by attribution work).
         if sampleCapacity && (lastSample == nil || now.timeIntervalSince(lastSample!) >= config.sampleInterval) {
-            if let (sample, method) = try? await sampleVolume() {
-                report.sample = sample
-                let decision = try await recordVolumeDecision(sample, method: method, now: now)
+            if let details = try? await sampleVolumeDetails() {
+                report.sample = details.sample
+                let decision = try await recordVolumeDecision(details, now: now)
                 report.decisions.append(decision)
+                let swap = swapSampler.sample(at: now)
+                try? await store.insert(swap)
             }
         }
 
@@ -232,6 +239,14 @@ public actor MonitorCoordinator {
                 report.gaps.append(gap)
                 lastCalibrationByRoot.removeAll()  // force recalibration of every root
             }
+        }
+
+        _ = try? await store.backfillPathWorkFromPendingHints(
+            limit: PathHintProcessor.maxPathsPerCycle * 4, now: now)
+        let pathChanges = try await processDuePathWork(now: now, mode: resourceMode())
+        if !pathChanges.isEmpty {
+            report.fileChangeCount += pathChanges.count
+            report.decisions.append(contentsOf: try await assembleAndEvaluate(changes: pathChanges, now: now))
         }
 
         // 3. Incremental session sync — before directory attribution.
@@ -278,7 +293,8 @@ public actor MonitorCoordinator {
             // degradation — not a silent gap.
             let roots = (try? await store.roots()) ?? []
             for root in roots {
-                try? await store.markRootState(rootID: root.id, state: .quotaLimited)
+                try? await store.markRootState(
+                    rootID: root.id, state: .quotaLimited, limitationKind: .lowSpace)
             }
             report.gaps.append(
                 CoverageGap(
@@ -304,10 +320,13 @@ public actor MonitorCoordinator {
     }
 
     @discardableResult
-    private func recordVolumeDecision(
-        _ sample: VolumeSample, method: VolumeMethod, now: Date
-    ) async throws -> AlertDecision {
-        try await store.insert(sample, method: method)
+    private func recordVolumeDecision(_ details: VolumeSampleDetails, now: Date) async throws -> AlertDecision {
+        let sample = details.sample
+        try await store.insert(sample, method: details.method)
+        try await store.insertVolumeContext(
+            sampleID: sample.id, method: details.method,
+            statfsFree: details.statfsFreeBytes, importantFree: details.importantUsageFreeBytes,
+            containerIdentity: details.containerIdentity)
         let decision = AlertPolicy.evaluate(
             observation: .volume(sample),
             evidence: [],
@@ -337,11 +356,11 @@ public actor MonitorCoordinator {
         try? await store.enqueueNotification(item)
     }
 
-    private func sampleVolume() async throws -> (VolumeSample, VolumeMethod) {
+    private func sampleVolumeDetails() async throws -> VolumeSampleDetails {
         let root = config.roots.first ?? URL(filePath: NSHomeDirectory())
-        let result = try sampler.sampleAndMethod(url: root, at: timeSource.now())
-        lastSample = result.0.observedAt
-        if result.0.status == .available { lastFreeBytes = result.0.freeBytes }
+        let result = try sampler.sampleDetails(url: root, at: timeSource.now())
+        lastSample = result.sample.observedAt
+        if result.sample.status == .available { lastFreeBytes = result.sample.freeBytes }
         return result
     }
 
@@ -442,6 +461,8 @@ public actor MonitorCoordinator {
                 start: now, cause: .resourceLimited, affectedRoots: [canonical], severity: .medium)
             openGaps.append(gap)
             try? await store.insert(gap)
+            try? await store.markRootState(
+                rootID: rootRecord.id, state: .quotaLimited, limitationKind: .byteBudget)
             try? await store.failScan(
                 rootID: rootRecord.id, scanID: scanID, reason: "quotaLimited",
                 state: .quotaLimited, at: timeSource.now())
@@ -458,8 +479,9 @@ public actor MonitorCoordinator {
     public func sampleIfDue() async throws {
         let now = timeSource.now()
         guard lastSample == nil || now.timeIntervalSince(lastSample!) >= config.sampleInterval else { return }
-        let (sample, method) = try await sampleVolume()
-        _ = try await recordVolumeDecision(sample, method: method, now: now)
+        let details = try await sampleVolumeDetails()
+        _ = try await recordVolumeDecision(details, now: now)
+        try? await store.insert(swapSampler.sample(at: now))
     }
 
     public func setPaused(_ value: Bool) async throws {
@@ -646,6 +668,55 @@ public actor MonitorCoordinator {
             }
             try? await store.recordPresence(result)
         }
+    }
+
+    private func processDuePathWork(now: Date, mode: ResourceMode) async throws -> [FileChange] {
+        let limit =
+            mode == .critical ? PathHintProcessor.maxPathsPerCycleCritical
+            : PathHintProcessor.maxPathsPerCycle
+        let work = (try? await store.duePathWork(limit: limit, now: now)) ?? []
+        guard !work.isEmpty else { return [] }
+        var emitted: [FileChange] = []
+        for item in work {
+            let canonical = FilePaths.canonical(item.path)
+            guard let root = try? await store.root(id: item.rootID),
+                let health = try? await store.rootHealth(rootID: item.rootID)
+            else {
+                try? await store.completePathWork(rootID: item.rootID, path: item.path)
+                continue
+            }
+            let probeResult = pathProbe.probe(canonical, observedAt: now)
+            let previous = try? await store.inventoryFile(rootID: item.rootID, path: canonical)
+            let hintKey = "\(item.rootID.uuidString)|\(canonical)"
+            let outcome = PathHintProcessor.process(
+                path: canonical, probe: probeResult, previous: previous, rootID: item.rootID,
+                activeScanID: health.activeScanID, windowStart: item.firstDirtyAt,
+                observedAt: now, hintKey: hintKey)
+            if let change = outcome.change {
+                if try await store.fileChange(id: change.id) == nil {
+                    try await store.insertFileChange(change)
+                    emitted.append(change)
+                }
+            }
+            if let scanID = health.activeScanID {
+                if let upsert = outcome.upsert {
+                    try? await store.upsertInventoryFile(rootID: item.rootID, scanID: scanID, file: upsert)
+                }
+                if let deleted = outcome.deletePath {
+                    try? await store.deleteInventoryFile(rootID: item.rootID, scanID: scanID, path: deleted)
+                }
+            }
+            switch probeResult {
+            case .failure(.permissionDenied):
+                try? await store.deferPathWork(
+                    rootID: item.rootID, path: item.path, workKind: item.workKind, attempt: 1, now: now)
+            default:
+                try? await store.completePathWork(rootID: item.rootID, path: item.path)
+                try? await store.markHintsProcessed(rootID: item.rootID, paths: [item.path])
+            }
+            _ = root
+        }
+        return emitted
     }
 
     /// Low-space ladder derived from the last observed free space.
