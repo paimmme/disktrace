@@ -138,7 +138,7 @@ public struct NotificationConfig: Sendable {
         agentGrowthWindowSeconds: TimeInterval = 300, agentCooldownSeconds: TimeInterval = 1_800,
         lowFreeBytes: Int64 = 10_000_000_000, lowFreeFraction: Double = 0.05,
         criticalFreeBytes: Int64 = 2_000_000_000, criticalFreeFraction: Double = 0.01,
-        safetyCooldownSeconds: TimeInterval = 1_800, criticalCooldownSeconds: TimeInterval = 300,
+        safetyCooldownSeconds: TimeInterval = 86_400, criticalCooldownSeconds: TimeInterval = 3_600,
         quietHours: QuietHours? = nil, criticalBypassesQuietHours: Bool = true
     ) {
         self.enabled = enabled

@@ -52,14 +52,14 @@ public enum CursorTranscriptParser {
 
     public static func parse(_ line: Data, now: Date = Date()) -> LineEvent {
         var scanner = CodexJSONScanner(line, maxValueBytes: 256)
-        guard try? scanner.consume(0x7B) == true else {
+        guard (try? scanner.consume(0x7B)) ?? false else {
             return LineEvent(kind: .ignored, timestamp: nil)
         }
         var role: String?
         var type: String?
         var status: String?
         var timestamp: Date?
-        if try? scanner.consume(0x7D) == true {
+        if (try? scanner.consume(0x7D)) ?? false {
             return LineEvent(kind: .ignored, timestamp: nil)
         }
         do {

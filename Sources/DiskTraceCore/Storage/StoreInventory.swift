@@ -56,45 +56,54 @@ extension DiskTraceStore {
 
     /// Updates only the health state, preserving the active generation and the
     /// last success time (used by the low-space state machine).
-    public func markRootState(rootID: UUID, state: RootState, coverage: String? = nil) throws {
+    public func markRootState(
+        rootID: UUID, state: RootState, coverage: String? = nil,
+        limitationKind: RootLimitationKind? = nil
+    ) throws {
         try rawExecute(
             """
-            INSERT INTO root_health (root_id, state, inventory_coverage) VALUES (?, ?, ?)
+            INSERT INTO root_health (root_id, state, inventory_coverage, limitation_kind) VALUES (?, ?, ?, ?)
             ON CONFLICT(root_id) DO UPDATE SET state=excluded.state,
-                inventory_coverage=COALESCE(excluded.inventory_coverage, root_health.inventory_coverage);
+                inventory_coverage=COALESCE(excluded.inventory_coverage, root_health.inventory_coverage),
+                limitation_kind=COALESCE(excluded.limitation_kind, root_health.limitation_kind);
             """,
-            [.text(rootID.uuidString), .text(state.rawValue), .text(coverage ?? "pending")])
+            [
+                .text(rootID.uuidString), .text(state.rawValue), .text(coverage ?? "pending"),
+                .optionalText(limitationKind?.rawValue),
+            ])
     }
 
     public func rootHealth(rootID: UUID) throws -> RootHealth? {
         let statement = try database.prepare("SELECT * FROM root_health WHERE root_id=?;")
         guard try statement.run([.text(rootID.uuidString)]) else { return nil }
+        let limitation = statement.optionalText(7).flatMap(RootLimitationKind.init(rawValue:))
         return RootHealth(
             rootID: rootID,
             activeScanID: statement.optionalText(1).flatMap(UUID.init(uuidString:)),
             state: RootState(rawValue: statement.text(2)) ?? .pending,
             lastSuccessAt: statement.optionalDate(3),
             nextRetryAt: statement.optionalDate(4),
-            inventoryCoverage: statement.text(6))
+            inventoryCoverage: statement.text(6), limitationKind: limitation)
     }
 
     public func setRootHealth(
         rootID: UUID, state: RootState, activeScanID: UUID?, lastSuccessAt: Date?,
-        nextRetryAt: Date?, coverage: String
+        nextRetryAt: Date?, coverage: String, limitationKind: RootLimitationKind? = nil
     ) throws {
         let statement = try database.prepare(
             """
             INSERT INTO root_health
-            (root_id, active_scan_id, state, last_success_at, next_retry_at, inventory_coverage)
-            VALUES (?,?,?,?,?,?)
+            (root_id, active_scan_id, state, last_success_at, next_retry_at, inventory_coverage, limitation_kind)
+            VALUES (?,?,?,?,?,?,?)
             ON CONFLICT(root_id) DO UPDATE SET active_scan_id=excluded.active_scan_id,
                 state=excluded.state, last_success_at=COALESCE(excluded.last_success_at, root_health.last_success_at),
-                next_retry_at=excluded.next_retry_at, inventory_coverage=excluded.inventory_coverage;
+                next_retry_at=excluded.next_retry_at, inventory_coverage=excluded.inventory_coverage,
+                limitation_kind=COALESCE(excluded.limitation_kind, root_health.limitation_kind);
             """)
         try statement.run([
             .text(rootID.uuidString), .optionalText(activeScanID?.uuidString),
             .text(state.rawValue), .optionalDate(lastSuccessAt), .optionalDate(nextRetryAt),
-            .text(coverage),
+            .text(coverage), .optionalText(limitationKind?.rawValue),
         ])
     }
 
@@ -545,7 +554,7 @@ extension DiskTraceStore {
         return result
     }
 
-    func insertFileChange(_ change: FileChange) throws {
+    public func insertFileChange(_ change: FileChange) throws {
         let statement = try database.prepare(
             """
             INSERT OR REPLACE INTO file_changes
@@ -636,165 +645,8 @@ extension DiskTraceStore {
                 """,
                 [.text(volumeID), .text(volumeIdentity), .text(String(checkpoint)), .date(date)])
         }
+        try enqueuePathWork(rootID: rootID, paths: hints.map(\.path), now: date)
         return hints.count
-    }
-
-    public struct PendingPathWork: Sendable {
-        public let rootID: UUID
-        public let path: String
-        public let firstDirtyAt: Date
-        public let lastDirtyAt: Date
-        public let attemptCount: Int
-    }
-
-    public func duePathWork(limit: Int, now: Date) throws -> [PendingPathWork] {
-        let statement = try database.prepare(
-            """
-            SELECT root_id, path, first_dirty_at, last_dirty_at, attempt_count
-            FROM pending_path_work
-            WHERE work_kind='probe' AND next_attempt_at<=?
-            ORDER BY last_dirty_at ASC LIMIT ?;
-            """)
-        try statement.bind([.date(now), .int(Int64(limit))])
-        var result: [PendingPathWork] = []
-        while try statement.step() {
-            guard let rootID = UUID(uuidString: statement.text(0)) else { continue }
-            result.append(
-                PendingPathWork(
-                    rootID: rootID, path: statement.text(1), firstDirtyAt: statement.date(2),
-                    lastDirtyAt: statement.date(3), attemptCount: statement.int(4)))
-        }
-        return result
-    }
-
-    public func finishPathWork(rootID: UUID, path: String) throws {
-        try rawExecute(
-            "DELETE FROM pending_path_work WHERE root_id=? AND path=? AND work_kind='probe';",
-            [.text(rootID.uuidString), .text(path)])
-        try rawExecute(
-            """
-            UPDATE change_hints SET processing_state='processed'
-            WHERE root_id=? AND path=? AND processing_state='pending';
-            """,
-            [.text(rootID.uuidString), .text(path)])
-    }
-
-    public func deferPathWork(rootID: UUID, path: String, attemptCount: Int, now: Date) throws {
-        let delay: TimeInterval
-        switch attemptCount {
-        case 0: delay = 5
-        case 1: delay = 30
-        default: delay = 300
-        }
-        try rawExecute(
-            """
-            UPDATE pending_path_work
-            SET attempt_count=attempt_count+1, next_attempt_at=?
-            WHERE root_id=? AND path=? AND work_kind='probe';
-            """,
-            [.date(now.addingTimeInterval(delay)), .text(rootID.uuidString), .text(path)])
-    }
-
-    /// Probes one path against the active inventory generation and records a
-    /// `liveHintWindow` file change when allocation differs.
-    public func applyLiveProbe(
-        rootID: UUID, metadata: FileMetadata, hintObservedAt: Date, now: Date
-    ) throws -> FileChange? {
-        guard let health = try rootHealth(rootID: rootID),
-            health.state == .ready, let scanID = health.activeScanID
-        else { return nil }
-
-        let statement = try database.prepare(
-            """
-            SELECT file_identity, allocated_bytes, logical_bytes, link_count
-            FROM file_inventory WHERE root_id=? AND scan_id=? AND path=?;
-            """)
-        try statement.bind([
-            .text(rootID.uuidString), .text(scanID.uuidString), .text(metadata.path),
-        ])
-        let hadRow = try statement.step()
-        let oldId = hadRow ? statement.optionalText(0) : nil
-        let oldAllocated = hadRow && !statement.isNull(1) ? statement.int64(1) : nil
-        let oldLogical = hadRow && !statement.isNull(2) ? statement.int64(2) : nil
-        let oldLink = hadRow && !statement.isNull(3) ? statement.int(3) : nil
-
-        try upsertInventoryRow(rootID: rootID, scanID: scanID, metadata: metadata)
-
-        let row = DiffRow(
-            path: metadata.path, oldId: oldId, newId: metadata.fileIdentity,
-            oldAllocated: oldAllocated, newAllocated: metadata.allocatedBytes,
-            oldLogical: oldLogical, newLogical: metadata.logicalBytes,
-            oldLink: oldLink, newLink: metadata.linkCount)
-
-        let windowStart = hintObservedAt
-        let locator = "live:\(metadata.path)|\(Int(hintObservedAt.timeIntervalSince1970))"
-        let change: FileChange?
-        if oldId == nil {
-            change = Self.change(
-                path: metadata.path, pathAfter: metadata.path, identityBefore: nil,
-                identityAfter: metadata.fileIdentity, kind: .added, before: nil,
-                after: metadata.allocatedBytes, beforeLogical: nil,
-                afterLogical: metadata.logicalBytes, delta: metadata.allocatedBytes,
-                rootID: rootID, scanID: scanID, windowStart: windowStart, windowEnd: now,
-                observedAt: now, timing: .liveHintWindow, locator: locator)
-        } else {
-            guard
-                var diff = Self.changedRow(
-                    row: row, rootID: rootID, scanID: scanID, windowStart: windowStart,
-                    windowEnd: now, observedAt: now, timing: .liveHintWindow)
-            else { return nil }
-            diff = FileChange(
-                id: FileChange.stableID(
-                    evidenceVersion: EvidenceVersion.current, rootID: rootID,
-                    identityBefore: diff.identityBefore, identityAfter: diff.identityAfter,
-                    pathBefore: diff.pathBefore, pathAfter: diff.pathAfter, locator: locator),
-                rootID: diff.rootID, scanID: diff.scanID, pathBefore: diff.pathBefore,
-                pathAfter: diff.pathAfter, identityBefore: diff.identityBefore,
-                identityAfter: diff.identityAfter, kind: diff.kind, windowStart: diff.windowStart,
-                windowEnd: diff.windowEnd, observedAt: diff.observedAt,
-                beforeLogical: diff.beforeLogical, afterLogical: diff.afterLogical,
-                beforeAllocated: diff.beforeAllocated, afterAllocated: diff.afterAllocated,
-                deltaAllocated: diff.deltaAllocated, measurement: diff.measurement,
-                timing: diff.timing, evidenceVersion: diff.evidenceVersion)
-            change = diff
-        }
-        if let change {
-            try insertFileChange(change)
-        }
-        return change
-    }
-
-    public func applyLiveRemoval(
-        rootID: UUID, path: String, hintObservedAt: Date, now: Date
-    ) throws -> FileChange? {
-        guard let health = try rootHealth(rootID: rootID),
-            health.state == .ready, let scanID = health.activeScanID
-        else { return nil }
-        let statement = try database.prepare(
-            """
-            SELECT file_identity, allocated_bytes, logical_bytes
-            FROM file_inventory WHERE root_id=? AND scan_id=? AND path=?;
-            """)
-        try statement.bind([
-            .text(rootID.uuidString), .text(scanID.uuidString), .text(path),
-        ])
-        guard try statement.step() else { return nil }
-        let oldId = statement.text(0)
-        let oldAllocated = statement.isNull(1) ? nil : statement.int64(1)
-        let oldLogical = statement.isNull(2) ? nil : statement.int64(2)
-        try rawExecute(
-            "DELETE FROM file_inventory WHERE root_id=? AND scan_id=? AND path=?;",
-            [.text(rootID.uuidString), .text(scanID.uuidString), .text(path)])
-        inventoryBudgetCache = nil
-        let locator = "live:\(path)|\(Int(hintObservedAt.timeIntervalSince1970))"
-        let change = Self.change(
-            path: path, pathAfter: path, identityBefore: oldId, identityAfter: nil,
-            kind: .removed, before: oldAllocated, after: nil, beforeLogical: oldLogical,
-            afterLogical: nil, delta: oldAllocated.map { -$0 }, rootID: rootID, scanID: scanID,
-            windowStart: hintObservedAt, windowEnd: now, observedAt: now,
-            timing: .liveHintWindow, locator: locator)
-        try insertFileChange(change)
-        return change
     }
 
     private func upsertInventoryRow(rootID: UUID, scanID: UUID, metadata: FileMetadata) throws {

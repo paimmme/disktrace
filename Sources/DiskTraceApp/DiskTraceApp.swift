@@ -5,8 +5,11 @@ import SwiftUI
 
 private enum Palette {
     static let blue = Color(red: 0.12, green: 0.36, blue: 0.72)
-    static let orange = Color(red: 0.76, green: 0.31, blue: 0.07)
+    /// Softer than system orange — used for large fills and charts.
+    static let orange = Color(red: 0.78, green: 0.42, blue: 0.24)
+    static let orangeFill = Color(red: 0.78, green: 0.42, blue: 0.24).opacity(0.28)
     static let green = Color(red: 0.12, green: 0.46, blue: 0.37)
+    static let greenFill = Color(red: 0.12, green: 0.46, blue: 0.37).opacity(0.28)
     static let surface = Color(nsColor: .controlBackgroundColor)
 }
 
@@ -121,6 +124,15 @@ struct RootView: View {
                 VStack(alignment: .leading, spacing: 7) {
                     Text(selected.rawValue).font(.system(size: 28, weight: .semibold))
                     Text(selected.subtitle).font(.callout).foregroundStyle(.secondary)
+                    if selected == .overview, let line = model.overviewHeadline {
+                        HeadlineCallout(text: line)
+                    }
+                    if selected == .events {
+                        HeadlineCallout(text: model.eventsHeadline)
+                    }
+                    if selected == .growth {
+                        HeadlineCallout(text: model.growthHeadline)
+                    }
                 }
                 Spacer(minLength: 20)
                 VStack(alignment: .trailing, spacing: 6) {
@@ -155,6 +167,9 @@ private struct OverviewView: View {
             }
             SectionPanel(title: "可用空间趋势", subtitle: "曲线下降表示剩余空间减少；这是整个卷的变化。") {
                 SpaceChart(samples: model.samples)
+            }
+            if let report = model.intervalReport {
+                IntervalVisualPanel(report: report)
             }
             HStack(alignment: .top, spacing: 24) {
                 VStack(alignment: .leading, spacing: 14) {
@@ -277,22 +292,22 @@ private struct GrowthView: View {
                     Text("全部变化").tag(0); Text("空间增加占用").tag(1); Text("空间释放").tag(2)
                 }.frame(width: 185)
             }
-            Text("显示所选时段的目录净变化。父目录包含子目录，数值不可直接相加；正数表示占用增加。")
+            if !rows.isEmpty {
+                SectionPanel(title: "占用增加最多（前 5）", subtitle: "只展示净变化最大的几项；完整列表在下方，点击可看详情。") {
+                    TopGrowthChart(rows: rows)
+                }
+            }
+            Text("父目录包含子目录，不要直接把数字相加。")
                 .font(.callout).foregroundStyle(.secondary)
             if rows.isEmpty {
                 EmptyState(icon: "folder.badge.questionmark", title: search.isEmpty ? "尚无匹配的目录变化" : "没有匹配的目录",
                            detail: "目录约每 15 分钟校准一次。变化只覆盖已监控路径；选择更长时段或清除筛选再查看。")
             } else {
-                HStack {
-                    Text("目录与最近校准"); Spacer(); Text("时段净变化").frame(width: 130, alignment: .trailing)
-                    Text("原因线索").frame(width: 100)
-                }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16)
-                LazyVStack(spacing: 0) {
+                LazyVStack(spacing: 10) {
                     ForEach(Array(rows.prefix(200))) { row in
                         Button { selected = row } label: { GrowthRow(row: row) }.buttonStyle(.plain)
-                        Divider().padding(.leading, 50)
                     }
-                }.background(Palette.surface).clipShape(RoundedRectangle(cornerRadius: 10))
+                }
                 Text(rows.count > 200 ? "共 \(rows.count) 个目录，显示净变化最大的 200 个。可搜索具体路径。" : "共 \(rows.count) 个目录。点击一行查看路径、测量窗口与证据。")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -313,10 +328,15 @@ private struct GrowthRow: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading)
             Text(signedBytes(row.netBytes)).font(.callout.weight(.semibold)).monospacedDigit()
-                .foregroundStyle(row.netBytes > 0 ? Palette.orange : Palette.green).frame(width: 130, alignment: .trailing)
+                .foregroundStyle(row.netBytes > 0 ? Palette.orange : Palette.green).frame(width: 120, alignment: .trailing)
             Text(row.decision?.readableClass ?? "尚未评估").font(.caption).foregroundStyle(.secondary).frame(width: 100)
             Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
-        }.padding(16).contentShape(Rectangle()).help(row.path)
+        }
+        .padding(16)
+        .background(Palette.surface.opacity(0.85))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .contentShape(Rectangle())
+        .help(row.path)
     }
 }
 
@@ -417,7 +437,11 @@ private struct HealthView: View {
                         HStack {
                             Label(shortPath(path), systemImage: "folder").textSelection(.enabled)
                             Spacer()
-                            Text(model.paused ? "已暂停" : (model.rootStates[path]?.state.readable ?? "等待记录"))
+                            Text(
+                                model.paused
+                                    ? "已暂停"
+                                    : (model.rootStates[path]?.state.readable(
+                                        limitation: model.rootStates[path]?.limitationKind) ?? "等待记录"))
                                 .font(.caption).foregroundStyle(.secondary)
                             Button("Finder") { model.reveal(path) }.buttonStyle(.borderless)
                         }
@@ -438,9 +462,15 @@ private struct HealthView: View {
                     }
                 }
             }
-            Notice(icon: "bell.slash", title: "当前提醒仅保存在应用内", detail: "系统通知、登录自动启动、具体文件追溯和可靠任务关联尚未完成。关闭主窗口不停止已启动的本地后台；退出登录后需重新启动。", color: Palette.blue)
+            Notice(icon: "bell.badge", title: "系统通知需在设置中授权", detail: "低空间可弹系统通知（每轮一次）。登录自动启动与可靠任务关联仍在完善。关闭主窗口不停止已启动的本地后台。", color: Palette.blue)
         }
     }
+}
+
+private var appBundleVersionLine: String {
+    let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+    return "界面版本 \(v) (\(b)) · 含 App 内监控目录"
 }
 
 struct SettingsView: View {
@@ -448,6 +478,7 @@ struct SettingsView: View {
     @StateObject private var background = BackgroundServiceController()
     var body: some View {
         Form {
+            MonitorRootsSettingsView().environmentObject(model)
             Section("历史数据位置") {
                 TextField("数据库路径", text: $model.databasePath)
                 Button("读取此数据库") { Task { await model.refresh() } }
@@ -473,30 +504,24 @@ struct SettingsView: View {
                     Button("授权系统提醒") { Task { await model.sendControl(.authorizeNotifications) } }
                     Button("发送测试提醒") { Task { await model.sendControl(.notificationTest) } }
                 }.disabled(model.controlPending)
+                Text("低空间时最多提醒一次；空间恢复后会再次允许提醒。需先授权系统通知。")
+                    .font(.caption).foregroundStyle(.secondary)
                 if let message = model.controlMessage { Text(message).font(.caption) }
             }
             Section("刷新与监控") {
                 Text("界面每 15 秒刷新；本机后台约每 60 秒采样、每 15 分钟校准目录。")
-                Text("监控范围和采样间隔目前由本地启动配置管理，尚不能在界面中修改。")
+                Text("采样间隔仍由 local-run.json 管理；监控目录在窗口最上方「监控目录」区勾选。")
                     .font(.caption).foregroundStyle(.secondary)
             }
-        }.formStyle(.grouped).padding().frame(width: 680, height: 640)
-    }
-}
-
-private struct SectionPanel<Content: View>: View {
-    let title: String
-    let subtitle: String
-    @ViewBuilder var content: Content
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(title).font(.headline)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            Section("关于此 App") {
+                Text(appBundleVersionLine).font(.callout.monospacedDigit())
+                if let label = model.agentBuildLabel {
+                    Text("后台写入构建：\(label)").font(.caption).foregroundStyle(.secondary)
+                }
+                Text("监控目录在设置最上方；保存后后台会自动重载监听。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            content
-        }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
-            .background(Palette.surface).clipShape(RoundedRectangle(cornerRadius: 12))
+        }.formStyle(.grouped).padding().frame(width: 680, height: 720)
     }
 }
 
@@ -508,6 +533,21 @@ private struct Metric: View {
             Text(value).font(.system(size: 23, weight: .medium, design: .rounded)).monospacedDigit()
             Text(note).font(.caption).foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct HeadlineCallout: View {
+    let text: String
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "text.quote").foregroundStyle(Palette.blue)
+            Text(text).font(.callout.weight(.medium)).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(.top, 4)
     }
 }
 

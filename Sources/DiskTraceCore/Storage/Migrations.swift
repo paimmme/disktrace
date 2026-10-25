@@ -2,8 +2,12 @@ import Foundation
 
 /// Versioned, transactional schema migrations. The schema is deliberately small
 /// and access-pattern driven rather than fully normalized.
+public enum DiskTraceSchemaVersion {
+    public static let current = Migrations.currentVersion
+}
+
 enum Migrations {
-    static let currentVersion = 6
+    static let currentVersion = 7
 
     static func migrate(_ database: SQLiteDatabase) throws {
         try database.execute(
@@ -54,6 +58,13 @@ enum Migrations {
                 try database.execute(schemaV6)
                 try database.execute("DELETE FROM schema_version;")
                 try database.execute("INSERT INTO schema_version(version) VALUES (6);")
+            }
+        }
+        if version < 7 {
+            try database.transaction {
+                try database.execute(schemaV7)
+                try database.execute("DELETE FROM schema_version;")
+                try database.execute("INSERT INTO schema_version(version) VALUES (7);")
             }
         }
     }
@@ -448,5 +459,22 @@ enum Migrations {
             FOREIGN KEY(event_id) REFERENCES storage_events(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_feedback_active ON event_feedback(event_id, revoked_at);
+        """
+
+    /// v7 — dual volume figures, swap sampling, explicit root limitation, build identity.
+    private static let schemaV7 = """
+        ALTER TABLE volume_measurement_context ADD COLUMN statfs_free_bytes INTEGER;
+        ALTER TABLE volume_measurement_context ADD COLUMN important_usage_free_bytes INTEGER;
+        ALTER TABLE volume_measurement_context ADD COLUMN container_identity TEXT;
+        ALTER TABLE root_health ADD COLUMN limitation_kind TEXT;
+
+        CREATE TABLE IF NOT EXISTS swap_samples (
+            id TEXT PRIMARY KEY,
+            observed_at REAL NOT NULL,
+            swap_used_bytes INTEGER,
+            swap_file_bytes INTEGER,
+            note TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_swap_samples_time ON swap_samples(observed_at);
         """
 }

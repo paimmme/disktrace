@@ -64,7 +64,7 @@ Honest, current limits. None of these is hidden behind marketing language.
 ## 原始需求闭环（本轮新增）的已知限制
 
 - **真实客户端未验证**：Codex 事件信封与 `originator/source/cli_version` 来自本机白名单观察，不是稳定公共合同；未观察到的版本一律降级为 unknown，不猜兼容。`client_verification` 只有验收程序能写 `realClientVerified`。
-- **live hint 的逐路径探测**：FSEvents 线索写入 `change_hints` 与 `pending_path_work`；后台每轮最多探测 32 条路径并产出 `liveHintWindow` 文件变化（需已有有效扫描基线）。权限失败会退避重试；仍不能替代 15 分钟全量校准。
+- **live hint 的逐路径探测**：FSEvents 线索写入 `change_hints` 与 `pending_path_work`；`PathHintProcessor` + `MetadataProbe` 每轮有界探测并产出 `liveHintWindow` 的 `file_changes`（需已有有效扫描基线）。**周期全量校准仍是主覆盖**；hint 不保证捕获扫描间隔内的短命文件；真实客户端任务归因见 `PRODUCT_STATUS.md`。
 - **目录校准为周期全量扫描**，不是事件驱动的子树拼接；正确但 I/O 更多。
 - **任务窗口的开放式/未结束**不会成为 `agentProbable` 的唯一证据；`agentConfirmed` 在本任务**永不产生**（无进程级能力）。
 - **presence checks** 为时钟驱动；真实 10 分钟/24 小时经过未运行。

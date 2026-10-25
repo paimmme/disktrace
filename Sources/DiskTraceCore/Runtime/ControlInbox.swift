@@ -3,17 +3,26 @@ import Foundation
 
 public enum ControlCommand: String, Codable, Sendable {
     case confirmUser, revokeUser, pause, resume, calibrate, authorizeNotifications, notificationTest
+    case updateMonitorRoots
 }
 public struct ControlRequest: Codable, Sendable {
     public let version: Int
     public let id: UUID
     public let command: ControlCommand
     public let eventID: UUID?
+    public let monitorRoots: [String]?
     public let issuedAt: Date
     public let expiresAt: Date
-    public init(command: ControlCommand, eventID: UUID? = nil, now: Date = Date()) {
-        version = 1; id = UUID(); self.command = command; self.eventID = eventID
-        issuedAt = now; expiresAt = now.addingTimeInterval(60)
+    public init(
+        command: ControlCommand, eventID: UUID? = nil, monitorRoots: [String]? = nil, now: Date = Date()
+    ) {
+        version = 1
+        id = UUID()
+        self.command = command
+        self.eventID = eventID
+        self.monitorRoots = monitorRoots
+        issuedAt = now
+        expiresAt = now.addingTimeInterval(60)
     }
 }
 public struct ControlReceipt: Codable, Sendable {
@@ -92,6 +101,16 @@ public struct ControlInbox: Sendable {
                     case .authorizeNotifications, .notificationTest:
                         detail = try await native(request.command)
                         try await store.setState(request.command == .authorizeNotifications ? "notification_authorization" : "notification_test", detail, at: now)
+                    case .updateMonitorRoots:
+                        guard let paths = request.monitorRoots, !paths.isEmpty else {
+                            throw NSError(domain: "DiskTrace", code: 1, userInfo: [
+                                NSLocalizedDescriptionKey: "monitorRoots 不能为空",
+                            ])
+                        }
+                        let saved = try LocalRunConfiguration.saveRoots(paths, support: support)
+                        try await coordinator.applyMonitorRoots(
+                            saved.map { URL(filePath: $0) }, configRevision: coordinator.configRevision + 1)
+                        detail = "已更新 \(saved.count) 个监控目录，文件监听已重启"
                     }
                     receipt = ControlReceipt(id: id, success: true, detail: detail)
                 } catch { receipt = ControlReceipt(id: id, success: false, detail: "操作未完成：\(error)") }

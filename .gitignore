@@ -6,3 +6,8 @@
 Package.resolved
 *.diff
 artifacts/
+local-run.json
+*.app/
+.DS_Store
+.env
+.env.*

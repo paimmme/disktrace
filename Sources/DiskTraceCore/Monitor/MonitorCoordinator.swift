@@ -80,13 +80,15 @@ public actor MonitorCoordinator {
         public var gaps: [CoverageGap] = []
     }
 
-    private let config: MonitorConfig
+    private var config: MonitorConfig
     private let store: DiskTraceStore
     private let scanner: ScannerBackend
     private let sampler: VolumeSampler
+    private let swapSampler: SwapSampler
     private let timeSource: TimeSource
     private let scannerName: String
     private let activitySync: AgentActivitySync?
+    private let pathProbe = MetadataProbe()
 
     private var changeMonitor: ChangeMonitor?
     private var lastCalibrationByRoot: [String: Date] = [:]
@@ -113,6 +115,7 @@ public actor MonitorCoordinator {
         store: DiskTraceStore,
         scanner: ScannerBackend = FixtureScanner(),
         sampler: VolumeSampler = VolumeSampler(),
+        swapSampler: SwapSampler = SwapSampler(),
         timeSource: TimeSource = SystemTimeSource(),
         scannerName: String = "fixture",
         activitySync: AgentActivitySync? = nil
@@ -121,12 +124,41 @@ public actor MonitorCoordinator {
         self.store = store
         self.scanner = scanner
         self.sampler = sampler
+        self.swapSampler = swapSampler
         self.timeSource = timeSource
         self.scannerName = scannerName
         self.activitySync = activitySync
     }
 
     public var isRunning: Bool { running }
+    public var configRevision: Int { config.configRevision }
+
+    /// Hot-reload monitor roots after the UI updates `local-run.json`.
+    public func applyMonitorRoots(_ roots: [URL], configRevision: Int) async throws {
+        guard running else { return }
+        changeMonitor?.stop()
+        config.roots = roots
+        config.configRevision = configRevision
+        let monitor = ChangeMonitor(
+            roots: config.roots, capacity: config.changeCapacity, timeSource: timeSource)
+        do {
+            try monitor.start()
+        } catch {
+            let gap = CoverageGap(
+                start: timeSource.now(), cause: .permissionDenied,
+                affectedRoots: config.roots.map(\.path), severity: .medium)
+            openGaps.append(gap)
+            try? await store.insert(gap)
+        }
+        changeMonitor = monitor
+        lastCalibrationByRoot.removeAll()
+        let now = timeSource.now()
+        for root in config.roots {
+            _ = try await store.ensureRoot(
+                canonicalPath: FilePaths.canonical(root.path), volumeID: nil,
+                configRevision: configRevision, at: now)
+        }
+    }
 
     public func start() async throws {
         guard !running else { return }
@@ -159,7 +191,8 @@ public actor MonitorCoordinator {
             if paused { break }
             if resourceMode() != .normal {
                 let record = try await store.ensureRoot(canonicalPath: FilePaths.canonical(root.path), volumeID: nil, configRevision: config.configRevision, at: timeSource.now())
-                try await store.markRootState(rootID: record.id, state: .quotaLimited)
+                try await store.markRootState(
+                    rootID: record.id, state: .quotaLimited, limitationKind: .lowSpace)
                 continue
             }
             let rootID = MonitoredRoot.stableID(canonicalPath: FilePaths.canonical(root.path))
@@ -211,10 +244,12 @@ public actor MonitorCoordinator {
 
         // 1. Volume sampling (never blocked by attribution work).
         if sampleCapacity && (lastSample == nil || now.timeIntervalSince(lastSample!) >= config.sampleInterval) {
-            if let (sample, method) = try? await sampleVolume() {
-                report.sample = sample
-                let decision = try await recordVolumeDecision(sample, method: method, now: now)
+            if let details = try? await sampleVolumeDetails() {
+                report.sample = details.sample
+                let decision = try await recordVolumeDecision(details, now: now)
                 report.decisions.append(decision)
+                let swap = swapSampler.sample(at: now)
+                try? await store.insert(swap)
             }
         }
 
@@ -223,14 +258,6 @@ public actor MonitorCoordinator {
         if let output = changeMonitor?.drain() {
             report.changeCount = output.hints.count
             try await persistHints(output.hints, at: now)
-            if resourceMode() == .normal {
-                let probed = try await processLivePathProbes(now: now)
-                report.fileChangeCount += probed.count
-                if !probed.isEmpty {
-                    report.decisions.append(
-                        contentsOf: try await assembleAndEvaluate(changes: probed, now: now))
-                }
-            }
             if output.overflowed {
                 let gap = CoverageGap(
                     start: now, cause: .fseventsOverflow,
@@ -240,6 +267,14 @@ public actor MonitorCoordinator {
                 report.gaps.append(gap)
                 lastCalibrationByRoot.removeAll()  // force recalibration of every root
             }
+        }
+
+        _ = try? await store.backfillPathWorkFromPendingHints(
+            limit: PathHintProcessor.maxPathsPerCycle * 4, now: now)
+        let pathChanges = try await processDuePathWork(now: now, mode: resourceMode())
+        if !pathChanges.isEmpty {
+            report.fileChangeCount += pathChanges.count
+            report.decisions.append(contentsOf: try await assembleAndEvaluate(changes: pathChanges, now: now))
         }
 
         // 3. Incremental session sync — before directory attribution.
@@ -286,7 +321,8 @@ public actor MonitorCoordinator {
             // degradation — not a silent gap.
             let roots = (try? await store.roots()) ?? []
             for root in roots {
-                try? await store.markRootState(rootID: root.id, state: .quotaLimited)
+                try? await store.markRootState(
+                    rootID: root.id, state: .quotaLimited, limitationKind: .lowSpace)
             }
             report.gaps.append(
                 CoverageGap(
@@ -312,10 +348,13 @@ public actor MonitorCoordinator {
     }
 
     @discardableResult
-    private func recordVolumeDecision(
-        _ sample: VolumeSample, method: VolumeMethod, now: Date
-    ) async throws -> AlertDecision {
-        try await store.insert(sample, method: method)
+    private func recordVolumeDecision(_ details: VolumeSampleDetails, now: Date) async throws -> AlertDecision {
+        let sample = details.sample
+        try await store.insert(sample, method: details.method)
+        try await store.insertVolumeContext(
+            sampleID: sample.id, method: details.method,
+            statfsFree: details.statfsFreeBytes, importantFree: details.importantUsageFreeBytes,
+            containerIdentity: details.containerIdentity)
         let decision = AlertPolicy.evaluate(
             observation: .volume(sample),
             evidence: [],
@@ -323,19 +362,47 @@ public actor MonitorCoordinator {
             config: config.policy,
             now: now)
         try await store.insert(decision)
-        await enqueueIfNeeded(decision, now: now)
+        await updateLowSpaceNotificationEpisode(sample: sample, decision: decision, now: now)
+        await enqueueIfNeeded(decision, now: now, volumeID: sample.volumeID)
         return decision
+    }
+
+    /// Clears the low-space episode after consecutive healthy samples so the next
+    /// crunch can notify once again.
+    private func updateLowSpaceNotificationEpisode(
+        sample: VolumeSample, decision: AlertDecision, now: Date
+    ) async {
+        let key = "notify:lowSpaceSafety"
+        guard sample.status == .available else { return }
+        let isLow = decision.action == .notifySafetyLowSpace
+        if isLow { return }
+        guard let state = try? await store.policyState(key: key) else { return }
+        let recovered = state.recoveredSamples + 1
+        if recovered >= 2 {
+            try? await store.setPolicyState(
+                key: key, severity: NotificationCategory.lowSpaceSafety.rawValue,
+                lastSentAt: nil, recoveredSamples: 0, at: now)
+        } else {
+            try? await store.setPolicyState(
+                key: key, severity: NotificationCategory.lowSpaceSafety.rawValue,
+                lastSentAt: state.lastSentAt, recoveredSamples: recovered, at: now)
+        }
     }
 
     /// Writes a pending outbox item for a notifying decision. Delivery happens
     /// in the agent (independently of any UI window).
-    private func enqueueIfNeeded(_ decision: AlertDecision, now: Date) async {
+    private func enqueueIfNeeded(_ decision: AlertDecision, now: Date, volumeID: String = "") async {
         guard decision.notifies else { return }
         let category: NotificationCategory
         switch decision.action {
         case .notifyAgentAnomaly: category = .agentGrowth
         case .notifySafetyLowSpace: category = .lowSpaceSafety
         case .silent: return
+        }
+        if category == .lowSpaceSafety {
+            let key = "notify:lowSpaceSafety"
+            if let state = try? await store.policyState(key: key), state.lastSentAt != nil { return }
+            if (try? await store.hasPendingNotification(category: .lowSpaceSafety)) == true { return }
         }
         let item = OutboxItem(
             id: OutboxItem.stableID(decisionID: decision.id), decisionID: decision.id,
@@ -345,11 +412,11 @@ public actor MonitorCoordinator {
         try? await store.enqueueNotification(item)
     }
 
-    private func sampleVolume() async throws -> (VolumeSample, VolumeMethod) {
+    private func sampleVolumeDetails() async throws -> VolumeSampleDetails {
         let root = config.roots.first ?? URL(filePath: NSHomeDirectory())
-        let result = try sampler.sampleAndMethod(url: root, at: timeSource.now())
-        lastSample = result.0.observedAt
-        if result.0.status == .available { lastFreeBytes = result.0.freeBytes }
+        let result = try sampler.sampleDetails(url: root, at: timeSource.now())
+        lastSample = result.sample.observedAt
+        if result.sample.status == .available { lastFreeBytes = result.sample.freeBytes }
         return result
     }
 
@@ -450,6 +517,8 @@ public actor MonitorCoordinator {
                 start: now, cause: .resourceLimited, affectedRoots: [canonical], severity: .medium)
             openGaps.append(gap)
             try? await store.insert(gap)
+            try? await store.markRootState(
+                rootID: rootRecord.id, state: .quotaLimited, limitationKind: .byteBudget)
             try? await store.failScan(
                 rootID: rootRecord.id, scanID: scanID, reason: "quotaLimited",
                 state: .quotaLimited, at: timeSource.now())
@@ -466,8 +535,9 @@ public actor MonitorCoordinator {
     public func sampleIfDue() async throws {
         let now = timeSource.now()
         guard lastSample == nil || now.timeIntervalSince(lastSample!) >= config.sampleInterval else { return }
-        let (sample, method) = try await sampleVolume()
-        _ = try await recordVolumeDecision(sample, method: method, now: now)
+        let details = try await sampleVolumeDetails()
+        _ = try await recordVolumeDecision(details, now: now)
+        try? await store.insert(swapSampler.sample(at: now))
     }
 
     public func setPaused(_ value: Bool) async throws {
@@ -493,39 +563,6 @@ public actor MonitorCoordinator {
     }
 
     public func requestCalibration() { lastCalibrationByRoot.removeAll() }
-
-    private func processLivePathProbes(now: Date, limit: Int = 32) async throws -> [FileChange] {
-        let probe = MetadataProbe()
-        let work = (try? await store.duePathWork(limit: limit, now: now)) ?? []
-        guard !work.isEmpty else { return [] }
-        var emitted: [FileChange] = []
-        for item in work {
-            if paused || Task.isCancelled { break }
-            switch probe.probe(item.path, observedAt: now) {
-            case .success(let metadata):
-                if let change = try await store.applyLiveProbe(
-                    rootID: item.rootID, metadata: metadata, hintObservedAt: item.firstDirtyAt,
-                    now: now)
-                {
-                    emitted.append(change)
-                }
-                try? await store.finishPathWork(rootID: item.rootID, path: item.path)
-            case .failure(.notFound):
-                if let change = try await store.applyLiveRemoval(
-                    rootID: item.rootID, path: item.path, hintObservedAt: item.firstDirtyAt,
-                    now: now)
-                {
-                    emitted.append(change)
-                }
-                try? await store.finishPathWork(rootID: item.rootID, path: item.path)
-            case .failure:
-                try? await store.deferPathWork(
-                    rootID: item.rootID, path: item.path, attemptCount: item.attemptCount,
-                    now: now)
-            }
-        }
-        return emitted
-    }
 
     private func persistHints(_ hints: [ChangeHint], at now: Date) async throws {
         guard !hints.isEmpty else { return }
@@ -687,6 +724,55 @@ public actor MonitorCoordinator {
             }
             try? await store.recordPresence(result)
         }
+    }
+
+    private func processDuePathWork(now: Date, mode: ResourceMode) async throws -> [FileChange] {
+        let limit =
+            mode == .critical ? PathHintProcessor.maxPathsPerCycleCritical
+            : PathHintProcessor.maxPathsPerCycle
+        let work = (try? await store.duePathWork(limit: limit, now: now)) ?? []
+        guard !work.isEmpty else { return [] }
+        var emitted: [FileChange] = []
+        for item in work {
+            let canonical = FilePaths.canonical(item.path)
+            guard let root = try? await store.root(id: item.rootID),
+                let health = try? await store.rootHealth(rootID: item.rootID)
+            else {
+                try? await store.completePathWork(rootID: item.rootID, path: item.path)
+                continue
+            }
+            let probeResult = pathProbe.probe(canonical, observedAt: now)
+            let previous = try? await store.inventoryFile(rootID: item.rootID, path: canonical)
+            let hintKey = "\(item.rootID.uuidString)|\(canonical)"
+            let outcome = PathHintProcessor.process(
+                path: canonical, probe: probeResult, previous: previous, rootID: item.rootID,
+                activeScanID: health.activeScanID, windowStart: item.firstDirtyAt,
+                observedAt: now, hintKey: hintKey)
+            if let change = outcome.change {
+                if try await store.fileChange(id: change.id) == nil {
+                    try await store.insertFileChange(change)
+                    emitted.append(change)
+                }
+            }
+            if let scanID = health.activeScanID {
+                if let upsert = outcome.upsert {
+                    try? await store.upsertInventoryFile(rootID: item.rootID, scanID: scanID, file: upsert)
+                }
+                if let deleted = outcome.deletePath {
+                    try? await store.deleteInventoryFile(rootID: item.rootID, scanID: scanID, path: deleted)
+                }
+            }
+            switch probeResult {
+            case .failure(.permissionDenied):
+                try? await store.deferPathWork(
+                    rootID: item.rootID, path: item.path, workKind: item.workKind, attempt: 1, now: now)
+            default:
+                try? await store.completePathWork(rootID: item.rootID, path: item.path)
+                try? await store.markHintsProcessed(rootID: item.rootID, paths: [item.path])
+            }
+            _ = root
+        }
+        return emitted
     }
 
     /// Low-space ladder derived from the last observed free space.

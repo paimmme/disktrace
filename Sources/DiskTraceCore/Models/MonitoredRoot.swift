@@ -49,10 +49,11 @@ public struct RootHealth: Sendable, Hashable {
     public let lastSuccessAt: Date?
     public let nextRetryAt: Date?
     public let inventoryCoverage: String
+    public let limitationKind: RootLimitationKind?
 
     public init(
         rootID: UUID, activeScanID: UUID?, state: RootState, lastSuccessAt: Date?,
-        nextRetryAt: Date?, inventoryCoverage: String
+        nextRetryAt: Date?, inventoryCoverage: String, limitationKind: RootLimitationKind? = nil
     ) {
         self.rootID = rootID
         self.activeScanID = activeScanID
@@ -60,6 +61,7 @@ public struct RootHealth: Sendable, Hashable {
         self.lastSuccessAt = lastSuccessAt
         self.nextRetryAt = nextRetryAt
         self.inventoryCoverage = inventoryCoverage
+        self.limitationKind = limitationKind
     }
 }
 

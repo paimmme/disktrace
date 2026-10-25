@@ -1,3 +1,4 @@
+import Charts
 import DiskTraceCore
 import SwiftUI
 
@@ -33,17 +34,51 @@ struct EventsView: View {
     }
 
     private var eventList: some View {
-        VStack(spacing: 0) {
-            ForEach(events) { event in
-                Button {
-                    Task { await model.selectEvent(event.id) }
-                } label: {
-                    EventRow(event: event, selected: model.selectedEventID == event.id)
+        VStack(alignment: .leading, spacing: 16) {
+            if events.count >= 2 {
+                EventTimelineChart(events: events)
+            }
+            LazyVStack(spacing: 10) {
+                ForEach(events) { event in
+                    Button {
+                        Task { await model.selectEvent(event.id) }
+                    } label: {
+                        EventRow(event: event, selected: model.selectedEventID == event.id)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
-                Divider()
             }
         }
+    }
+}
+
+/// 事件净变化时间分布（仅展示有数字的事件，未知不画成 0）。
+private struct EventTimelineChart: View {
+    let events: [StorageEvent]
+    private var points: [StorageEvent] {
+        events.filter { $0.netBytes != nil }.prefix(40).sorted { $0.windowEnd < $1.windowEnd }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("事件时间分布").font(.headline)
+            Text("柱越高表示该时间窗内占用增加越多（有测量值的事件）。")
+                .font(.caption).foregroundStyle(.secondary)
+            if points.isEmpty {
+                Text("当前事件缺少可绘制的净变化数值。").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Chart(points) { event in
+                    BarMark(
+                        x: .value("时间", event.windowEnd),
+                        y: .value("净变化 MB", Double(event.netBytes ?? 0) / 1_000_000)
+                    )
+                    .foregroundStyle((event.netBytes ?? 0) >= 0 ? Color.orange.opacity(0.55) : Color.green.opacity(0.55))
+                }
+                .chartYAxis { AxisMarks(position: .leading) }
+                .frame(height: 160)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
     }
 }
@@ -53,31 +88,44 @@ private struct EventRow: View {
     let selected: Bool
 
     var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(shortPath(event.scopePath)).font(.body.weight(.medium)).lineLimit(2)
-                Text("\(event.windowStart.formatted(date: .abbreviated, time: .shortened)) · \(categoryText(event.reasonCategory))")
+        HStack(alignment: .center, spacing: 16) {
+            Image(systemName: icon(for: event))
+                .font(.title2)
+                .foregroundStyle((event.netBytes ?? 0) >= 0 ? .orange : .green)
+                .frame(width: 36)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(URL(filePath: event.scopePath).lastPathComponent)
+                    .font(.body.weight(.semibold)).lineLimit(1)
+                Text("\(categoryText(event.reasonCategory)) · \(attributionText(event.attributionClass))")
                     .font(.caption).foregroundStyle(.secondary)
+                Text(event.windowStart.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption2).foregroundStyle(.tertiary)
             }
-            Spacer(minLength: 12)
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(event.netBytes.map(signedBytes) ?? "未知")
-                    .font(.body.monospacedDigit())
-                    .foregroundStyle((event.netBytes ?? 0) >= 0 ? Color.orange : Color.green)
-                HStack(spacing: 6) {
-                    tag(attributionText(event.attributionClass), color: attributionColor(event.attributionClass))
-                    tag(measurementText(event.measurement), color: .secondary)
-                }
-            }
+            Spacer(minLength: 8)
+            Text(event.netBytes.map(signedBytes) ?? "未知")
+                .font(.title3.weight(.semibold).monospacedDigit())
+                .foregroundStyle((event.netBytes ?? 0) >= 0 ? Color.orange : Color.green)
         }
-        .padding(14)
-        .background(selected ? Color.accentColor.opacity(0.12) : .clear)
+        .padding(16)
+        .background(selected ? Color.accentColor.opacity(0.14) : Color.clear)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(selected ? 0 : 0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(selected ? Color.accentColor.opacity(0.35) : Color.clear, lineWidth: 1))
         .contentShape(Rectangle())
     }
 
-    private func tag(_ text: String, color: Color) -> some View {
-        Text(text).font(.caption2).padding(.horizontal, 7).padding(.vertical, 2)
-            .background(color.opacity(0.15), in: Capsule()).foregroundStyle(color)
+    private func icon(for event: StorageEvent) -> String {
+        switch event.reasonCategory {
+        case .dependencies: return "shippingbox"
+        case .buildOutputs: return "hammer"
+        case .modelCache: return "brain"
+        case .sessionArtifacts: return "doc.text"
+        case .downloadsFolder: return "arrow.down.circle"
+        case .temporaryFiles: return "clock"
+        case .mixed, .unknown: return "folder"
+        }
     }
 }
 
@@ -91,7 +139,9 @@ private struct EventDetail: View {
             if model.eventFiles.isEmpty {
                 Text("没有保留的文件明细（可能已过保留期）。").font(.callout).foregroundStyle(.secondary)
             } else {
-                fileTable
+                FileImpactBars(files: model.eventFiles)
+                DisclosureGroup("查看完整文件列表") { fileTable }
+                    .font(.subheadline)
             }
             if !model.eventLinks.isEmpty {
                 Divider()
